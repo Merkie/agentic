@@ -47,3 +47,5 @@ const result = await generateText({
 I think we should define the agent group or chats or whatever as some sort of global scope or scoped thing that we can import and export across files, like one file can send a message and the other file can recieve the stream if that makes sense.
 
 We will need extensive testing to make sure the framework logic is sound before we start converting it into a proper package. And we can capture chat replay for tests so we dont need to like keep calling the API directly.
+
+I also want this to be like "sqlite for agentic stuff" so we can save and replay from a single .jsonl file or have multiple of them going for different chats.
