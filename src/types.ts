@@ -21,7 +21,7 @@ export interface AgenticSessionOptions {
   model?: string;
   tools?: AgenticToolSet | ToolFactory<AgenticToolSet>;
   maxSteps?: number;
-  logFile?: string;
+  file?: string;
   context?: Record<string, unknown>;
 }
 
@@ -123,7 +123,7 @@ export interface AgenticRunResult {
   };
   finishReason: string;
   aborted: boolean;
-  logFile: string;
+  file: string;
 }
 
 export type AgenticEventHandler = (event: AgenticStreamEvent) => void | Promise<void>;

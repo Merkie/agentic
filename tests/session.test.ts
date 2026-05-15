@@ -21,7 +21,7 @@ function installFakeProvider() {
 describe("AgenticSession", () => {
   it("runs streamText, logs step messages, and emits early tool events", async () => {
     const cleanup = installFakeProvider();
-    const logFile = tmpFile("chat.jsonl");
+    const file = tmpFile("chat.jsonl");
     const streamTextImpl: StreamTextImpl = (options) => {
       (options.onStepFinish as any)({
         stepNumber: 1,
@@ -48,7 +48,7 @@ describe("AgenticSession", () => {
         streamTextImpl,
         getModelContextLength: () => 100,
       });
-      const session = agentic.getSession({ id: "s1", logFile });
+      const session = agentic.getSession({ id: "s1", file });
       const events: string[] = [];
       session.onEvent((event) => {
         events.push(event.type);
@@ -60,7 +60,7 @@ describe("AgenticSession", () => {
       expect(result.cost.total).toBe(0.001);
       expect(result.context.usedPct).toBe(0.05);
       expect(events).toContain("tool-input-start");
-      expect(readJsonl(logFile).some((line) => line.kind === "step_messages")).toBe(true);
+      expect(readJsonl(file).some((line) => line.kind === "step_messages")).toBe(true);
     } finally {
       cleanup();
     }
@@ -68,7 +68,7 @@ describe("AgenticSession", () => {
 
   it("groups queued messages into the next run while a stream is active", async () => {
     const cleanup = installFakeProvider();
-    const logFile = tmpFile("chat.jsonl");
+    const file = tmpFile("chat.jsonl");
     let releaseFirst: (() => void) | undefined;
     const seenInputLengths: number[] = [];
     const streamTextImpl: StreamTextImpl = (options) => {
@@ -102,7 +102,7 @@ describe("AgenticSession", () => {
         streamTextImpl,
         getModelContextLength: () => null,
       });
-      const session = agentic.getSession({ id: "s1", logFile });
+      const session = agentic.getSession({ id: "s1", file });
 
       const first = session.send("first");
       await vi.waitFor(() => expect(releaseFirst).toBeTypeOf("function"));
@@ -112,7 +112,7 @@ describe("AgenticSession", () => {
       releaseFirst?.();
       await Promise.all([first, second, third]);
 
-      const runStarts = readJsonl(logFile).filter((line) => line.kind === "run_start");
+      const runStarts = readJsonl(file).filter((line) => line.kind === "run_start");
       expect(runStarts).toHaveLength(2);
       expect(runStarts[1]?.inputMessages).toHaveLength(2);
       expect(seenInputLengths).toEqual([1, 4]);
@@ -123,7 +123,7 @@ describe("AgenticSession", () => {
 
   it("aborts an active stream and persists a run_aborted line", async () => {
     const cleanup = installFakeProvider();
-    const logFile = tmpFile("chat.jsonl");
+    const file = tmpFile("chat.jsonl");
     let releaseStream: (() => void) | undefined;
     const streamTextImpl: StreamTextImpl = (options) => {
       return {
@@ -149,7 +149,7 @@ describe("AgenticSession", () => {
         streamTextImpl,
         getModelContextLength: () => null,
       });
-      const session = agentic.getSession({ id: "s1", logFile });
+      const session = agentic.getSession({ id: "s1", file });
       const resultPromise = session.send("start");
       await vi.waitFor(() => expect(releaseStream).toBeTypeOf("function"));
 
@@ -159,7 +159,7 @@ describe("AgenticSession", () => {
 
       expect(result.aborted).toBe(true);
       expect(result.text).toBe("Partial");
-      expect(readJsonl(logFile).some((line) => line.kind === "run_aborted")).toBe(true);
+      expect(readJsonl(file).some((line) => line.kind === "run_aborted")).toBe(true);
     } finally {
       cleanup();
     }

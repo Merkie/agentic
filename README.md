@@ -88,7 +88,7 @@ history loads lazily on first use:
 ```ts
 const session = agentic.getSession({
   id: "chat_123",
-  logFile: "sessions/chat_123.jsonl",
+  file: "sessions/chat_123.jsonl",
 });
 
 console.log(session.history); // ModelMessage[], straight out of the JSONL

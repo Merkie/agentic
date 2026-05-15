@@ -16,7 +16,7 @@ if (!prompt) {
   process.exit(1);
 }
 
-const logFile = process.env.CHAT_LOG ?? "chat.jsonl";
+const file = process.env.CHAT_LOG ?? "chat.jsonl";
 const model = process.env.MODEL ?? "google/gemini-3.1-flash-lite-preview";
 
 const tools = createTools(() => ({
@@ -38,14 +38,14 @@ const agentic = createAgentic({
 
 const session = agentic.getSession({
   id: "cli",
-  logFile,
+  file,
   model,
   system:
     "You are a concise assistant. Use tools when they help, then answer directly.",
   tools,
 });
 
-console.log(existsSync(logFile) ? `(continuing ${logFile})` : `(new ${logFile})`);
+console.log(existsSync(file) ? `(continuing ${file})` : `(new ${file})`);
 console.log(`\n[user] ${prompt}\n`);
 
 let assistantOpen = false;
@@ -74,4 +74,4 @@ session.onEvent((event) => {
 });
 
 const result = await session.send(prompt);
-console.log(`\n(saved ${result.logFile}, finish=${result.finishReason})`);
+console.log(`\n(saved ${result.file}, finish=${result.finishReason})`);

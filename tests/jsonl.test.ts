@@ -40,7 +40,7 @@ describe("jsonl replay via session", () => {
     logger.close();
 
     const agentic = createAgentic({ openRouterApiKey: "test" });
-    const session = agentic.getSession({ id: "chat", logFile: file });
+    const session = agentic.getSession({ id: "chat", file });
 
     expect(session.history.map((message) => message.role)).toEqual([
       "user",

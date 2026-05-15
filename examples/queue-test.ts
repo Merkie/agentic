@@ -53,9 +53,9 @@ function attachEventLogger(session: ReturnType<typeof agentic.getSession>) {
   });
 }
 
-function summarizeRunStarts(logFile: string) {
-  const runStarts = readJsonl(logFile).filter((r) => r.kind === "run_start");
-  console.log(`\n--- ${logFile} → ${runStarts.length} run_start record(s) ---`);
+function summarizeRunStarts(file: string) {
+  const runStarts = readJsonl(file).filter((r) => r.kind === "run_start");
+  console.log(`\n--- ${file} → ${runStarts.length} run_start record(s) ---`);
   runStarts.forEach((r: any, i) => {
     console.log(`  run #${i + 1}: ${r.inputMessages.length} input message(s)`);
     r.inputMessages.forEach((m: any, j: number) => {
@@ -73,7 +73,7 @@ console.log("\n========================= PHASE A: 1 queued =====================
 const logA = `queue-test-A-${Date.now()}.jsonl`;
 const sessionA = agentic.getSession({
   id: "queue-test-A",
-  logFile: logA,
+  file: logA,
   system:
     "You are a concise assistant. When asked to write a file, call the write_file tool exactly once per requested file, then briefly confirm in one short sentence.",
   tools,
@@ -102,7 +102,7 @@ console.log("\n========================= PHASE B: 3 queued =====================
 const logB = `queue-test-B-${Date.now()}.jsonl`;
 const sessionB = agentic.getSession({
   id: "queue-test-B",
-  logFile: logB,
+  file: logB,
   system:
     "You are a concise assistant. When asked to write files, call the write_file tool once per file requested across ALL user messages in this turn, then briefly confirm in one short sentence.",
   tools,

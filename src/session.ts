@@ -109,9 +109,9 @@ export class AgenticSession {
     return this.options.id;
   }
 
-  get logFile(): string {
+  get file(): string {
     return (
-      this.options.logFile ??
+      this.options.file ??
       path.join(
         this.runtime.config.sessionsDir ?? DEFAULT_SESSIONS_DIR,
         `${sanitizeFileName(this.options.id)}.jsonl`,
@@ -178,7 +178,7 @@ export class AgenticSession {
 
   private ensureInitializedFromLog(): void {
     if (this.initializedFromLog) return;
-    const replayed = replayJsonl(this.logFile);
+    const replayed = replayJsonl(this.file);
     this.messages = replayed.fullMessages;
     this.initializedFromLog = true;
   }
@@ -187,7 +187,7 @@ export class AgenticSession {
     const runId = createRunId();
     const model = this.options.model ?? this.runtime.config.defaultModel ?? DEFAULT_MODEL;
     const maxSteps = this.options.maxSteps ?? this.runtime.config.maxSteps ?? DEFAULT_MAX_STEPS;
-    const logger = new JsonlLogger(this.logFile);
+    const logger = new JsonlLogger(this.file);
     const abortController = new AbortController();
     this.abortController = abortController;
 
@@ -389,7 +389,7 @@ export class AgenticSession {
         context,
         finishReason,
         aborted,
-        logFile: this.logFile,
+        file: this.file,
       };
 
       logger.append({
