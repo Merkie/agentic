@@ -3,19 +3,18 @@
 Opinionated `streamText()`-first framework for building AI agents in JS.
 
 The package wraps the Vercel AI SDK + OpenRouter with the bits every real agent
-app keeps rewriting: session state, raw JSONL replay, queued messages, early
-tool-call streaming, abort salvage, cost tracking, and context-window math.
+app keeps rewriting: session state, raw `ModelMessage[]` persistence to JSONL,
+queued messages, early tool-call streaming, abort salvage, cost tracking, and
+context-window math.
 
 ## Features
 
 - **OpenRouter-first provider setup** with usage accounting enabled.
 - **Session abstraction** around `streamText()` with one active run per session.
 - **Queued messages** so user messages and system notifications that arrive mid-run are grouped into the next turn.
-- **`<SystemNotification>` helper** for wakeups, background task completions, and app-level events.
 - **Abort handling** with an in-memory `AbortController` per active session.
 - **Partial stream salvage** for aborted runs, including synthetic tool results for dangling tool calls so replay stays valid.
-- **Raw JSONL persistence**: append-only logs with `run_start`, `stream_event`, `step_messages`, `run_end`, `run_aborted`, and `cost_summary`.
-- **Replay helpers** that reconstruct AI SDK `ModelMessage[]` directly from JSONL.
+- **Raw `ModelMessage[]` persistence**: every `streamText()` input message and step output message is appended to an append-only `.jsonl` exactly as the AI SDK produced it — no custom schema, no display-string round-trip. Replay is "read the lines back in order."
 - **Early tool-call detection** via `tool-input-start`, `tool-input-delta`, `tool-input-end`, `tool-call`, and `tool-result` events.
 - **Tool factories** for binding app/session state through closure instead of model-controlled parameters.
 - **OpenRouter model catalog helpers** with TTL cache, inflight de-dupe, stale fallback, context length lookup, and fail-open model validation.
@@ -66,20 +65,42 @@ session.onEvent((event) => {
 await session.send("Who am I?");
 ```
 
-## JSONL Replay
+## JSONL Persistence
 
-Every session writes a raw `.jsonl` file. The important replay invariant is:
-persist AI SDK `ModelMessage[]`, not just display strings. Tool calls and tool
-results must survive round trips or future turns break tool-use continuity.
+Persistence is deliberately dumb: every turn appends two record kinds to a
+`.jsonl` file:
+
+- `run_start` — carries the `ModelMessage[]` that went into `streamText()` for
+  that turn (the new user messages, system notifications, etc.).
+- `step_messages` — carries each `ModelMessage` that came out of a step
+  (assistant text, tool calls, tool results), exactly as the AI SDK emitted it.
+
+Both record kinds store the **AI SDK's own message objects** — not display
+strings, not a custom schema. Tool calls and tool results survive round trips
+verbatim, which is what lets future turns continue with tool-use continuity
+intact.
+
+Replay is "open the file and read those lines back in order." There is no
+reconstruction step. The same `ModelMessage[]` you'd hand to `streamText()`
+comes straight out. Point a new session at an existing log file and the prior
+history loads lazily on first use:
 
 ```ts
-import { replayJsonl } from "@merkie/agentic";
+const session = agentic.getSession({
+  id: "chat_123",
+  logFile: "sessions/chat_123.jsonl",
+});
 
-const replayed = replayJsonl("sessions/chat_123.jsonl");
+console.log(session.history); // ModelMessage[], straight out of the JSONL
 
-// Feed this back into streamText({ messages }) or inspect it in tests.
-console.log(replayed.fullMessages);
+await session.send("And what did I ask before?"); // picks up where the log left off
 ```
+
+You don't need to hand-feed prior messages — sending a new message reuses the
+loaded history automatically. Other record kinds (`stream_event`, `run_end`,
+`run_aborted`, `cost_summary`) are also appended for debugging and cost
+tracking, but the message history itself comes from `run_start` + `step_messages`
+alone.
 
 ## System Notifications
 

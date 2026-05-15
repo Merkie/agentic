@@ -4,9 +4,7 @@ export {
   appendJsonl,
   countJsonlStreamEvents,
   readJsonl,
-  replayJsonl,
   type JsonlRecord,
-  type ReplayedJsonlSession,
 } from "./jsonl.js";
 export {
   INTERRUPTED_TOOL_RESULT_VALUE,

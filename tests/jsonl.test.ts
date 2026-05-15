@@ -2,14 +2,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { JsonlLogger, countJsonlStreamEvents, replayJsonl } from "../src/index.js";
+import { JsonlLogger, countJsonlStreamEvents, createAgentic } from "../src/index.js";
 
 function tmpFile(name: string): string {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "agentic-jsonl-")), name);
 }
 
-describe("jsonl replay", () => {
-  it("reconstructs multi-turn ModelMessage history from raw JSONL", () => {
+describe("jsonl replay via session", () => {
+  it("loads multi-turn ModelMessage history from JSONL on session.history", () => {
     const file = tmpFile("chat.jsonl");
     const logger = new JsonlLogger(file);
     logger.append({
@@ -39,10 +39,10 @@ describe("jsonl replay", () => {
     logger.append({ kind: "run_end", finishReason: "stop" });
     logger.close();
 
-    const replayed = replayJsonl(file);
-    expect(replayed.model).toBe("test/model");
-    expect(replayed.system).toBe("system");
-    expect(replayed.fullMessages.map((message) => message.role)).toEqual([
+    const agentic = createAgentic({ openRouterApiKey: "test" });
+    const session = agentic.getSession({ id: "chat", logFile: file });
+
+    expect(session.history.map((message) => message.role)).toEqual([
       "user",
       "assistant",
       "user",
