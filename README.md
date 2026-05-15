@@ -1,51 +1,143 @@
-# agentic
+# @merkie/agentic
 
-Opinionated framework for building AI agents in JS
+Opinionated `streamText()`-first framework for building AI agents in JS.
 
-### What & Why
+The package wraps the Vercel AI SDK + OpenRouter with the bits every real agent
+app keeps rewriting: session state, raw JSONL replay, queued messages, early
+tool-call streaming, abort salvage, cost tracking, and context-window math.
 
-The best foundation for building AI agents (in my opinion) is currently the [AI SDK](https://www.npmjs.com/package/ai) by Vercel with the [OpenRouter Provider](https://www.npmjs.com/package/@openrouter/ai-sdk-provider). This gives you a great translation layer that you could take to other providers and you get every model with OpenRouter with just a string. Whereas using native provider packages require installing new packages, etc. You could dynamically update an OpenRouter model string without any code changes theoretically. So it's way more flexible and future-proof.
+## Features
 
-But even when you use those packages, you are still missing basic things. Like for example, listing the models available to you. You need to hit `https://openrouter.ai/api/v1/models?input_modalities=text,image` directly or install the entire native openrouter sdk on top of the ai provider package. And the API isn't even typed since it's just a fetch. That's one thing I aim to solve with this package, just put everything in one WITH functions to work with the model list.
+- **OpenRouter-first provider setup** with usage accounting enabled.
+- **Session abstraction** around `streamText()` with one active run per session.
+- **Queued messages** so user messages and system notifications that arrive mid-run are grouped into the next turn.
+- **`<SystemNotification>` helper** for wakeups, background task completions, and app-level events.
+- **Abort handling** with an in-memory `AbortController` per active session.
+- **Partial stream salvage** for aborted runs, including synthetic tool results for dangling tool calls so replay stays valid.
+- **Raw JSONL persistence**: append-only logs with `run_start`, `stream_event`, `step_messages`, `run_end`, `run_aborted`, and `cost_summary`.
+- **Replay helpers** that reconstruct AI SDK `ModelMessage[]` directly from JSONL.
+- **Early tool-call detection** via `tool-input-start`, `tool-input-delta`, `tool-input-end`, `tool-call`, and `tool-result` events.
+- **Tool factories** for binding app/session state through closure instead of model-controlled parameters.
+- **OpenRouter model catalog helpers** with TTL cache, inflight de-dupe, stale fallback, context length lookup, and fail-open model validation.
+- **Cost + context tracking** from AI SDK usage and OpenRouter provider metadata.
 
-On that note as well, there's no way in the AI SDK to see the context window that's been used as a %, you have to fetch the model info from openrouter or take it from the list endpoint in openrouter, then rig up the math yourself based on the tokens used in the conversation.
+## Install
 
-There's also no way to track conversations really, or save them properly and replay them, you have to do that all yourself. And by doing this it can track things like total tokens used, take that and divide by the token context window size and get the % used. We also want to track the cost like this:
-
-```ts
-createOpenRouter({
-  apiKey: process.env.OPENROUTER_API_KEY,
-  // Optional: opt in to per-call cost reporting on providerMetadata.
-  extraBody: { usage: { include: true } } as any,
-});
+```sh
+pnpm add @merkie/agentic ai @openrouter/ai-sdk-provider zod
 ```
 
-And that will return the cost of each step, and we need to add that up as a cumulative value for conversations as well. And for this package we should probably call them sessions instead of conversations since they can be more than just conversations, they will be holding state and be used for like agentic workflows, etc.
+This repo itself uses `pnpm` and pins the package manager in `package.json`.
 
-We will also track the abort signal based on this abstraction as well, since right now doing chat aborts via an abort controller is a total bring-your-own situation, and it could easily be intertwined with the session/conversation state management like the mesasges coming in, the tokens used, the cost, etc. So we can have a `session.abort()` function that will trigger the abort controller and then we can handle that properly in the provider implementation and also in the session state management.
-
-Other patterns we might want to use:
-
-- createTools() type tool factory that has shared state
-- This fix for google models:
+## Quickstart
 
 ```ts
-const result = await generateText({
-  model: openrouter(input.model, {
-    // Google AI Studio's Gemini endpoint drops thought signatures across the
-    // OpenRouter→Google translation, then rejects the next turn with
-    // "Corrupted thought signature". Route to any other provider.
-    extraBody: { provider: { ignore: ["google-ai-studio"] } },
+import { createAgentic, createTools } from "@merkie/agentic";
+import { tool } from "ai";
+import { z } from "zod";
+
+const tools = createTools(({ context }) => ({
+  lookup_user: tool({
+    description: "Look up the current application user.",
+    inputSchema: z.object({}),
+    execute: async () => ({ userId: context.userId }),
   }),
-  system: input.system,
-  prompt: input.prompt,
+}));
+
+const agentic = createAgentic({
+  openRouterApiKey: process.env.OPENROUTER_API_KEY!,
+  defaultModel: "google/gemini-3.1-flash-lite-preview",
+});
+
+const session = agentic.getSession({
+  id: "chat_123",
+  system: "You are a concise assistant.",
+  tools,
+  context: { userId: "user_123" },
+});
+
+session.onEvent((event) => {
+  if (event.type === "text-delta") process.stdout.write(event.text);
+  if (event.type === "tool-input-start") {
+    console.log(`\ncalling ${event.toolName}`);
+  }
+});
+
+await session.send("Who am I?");
+```
+
+## JSONL Replay
+
+Every session writes a raw `.jsonl` file. The important replay invariant is:
+persist AI SDK `ModelMessage[]`, not just display strings. Tool calls and tool
+results must survive round trips or future turns break tool-use continuity.
+
+```ts
+import { replayJsonl } from "@merkie/agentic";
+
+const replayed = replayJsonl("sessions/chat_123.jsonl");
+
+// Feed this back into streamText({ messages }) or inspect it in tests.
+console.log(replayed.fullMessages);
+```
+
+## System Notifications
+
+`formatSystemNotification` wraps content in a `<SystemNotification>` block.
+Send it like any other message — if a run is active it queues and is grouped
+with any other pending messages on the next turn.
+
+```ts
+import { formatSystemNotification } from "@merkie/agentic";
+
+await session.send({
+  role: "user",
+  content: formatSystemNotification("Background task completed.", {
+    taskId: "task_123",
+    status: "completed",
+  }),
 });
 ```
 
-- queue'd messages, like if the agent is currently running and you want to send a new message to it (e.g. a system notification) you can just send it and it will be queued and sent right when it's done with the current message. and it would send all queued messages together when it's done so it can address everything all together, not 1-by-1. This would be really good for like agentic workflows where you have a bunch of steps and you want to send updates to the agent as it works through those steps, but you don't want to interrupt it in the middle of processing something. I think any message sent to the agent should have to go through this queue system.
+This becomes:
 
-I think we should define the agent group or chats or whatever as some sort of global scope or scoped thing that we can import and export across files, like one file can send a message and the other file can recieve the stream if that makes sense.
+```xml
+<SystemNotification>
+Background task completed.
 
-We will need extensive testing to make sure the framework logic is sound before we start converting it into a proper package. And we can capture chat replay for tests so we dont need to like keep calling the API directly.
+Metadata:
+{ "taskId": "task_123", "status": "completed" }
+</SystemNotification>
+```
 
-I also want this to be like "sqlite for agentic stuff" so we can save and replay from a single .jsonl file or have multiple of them going for different chats.
+## Abort
+
+```ts
+const pending = session.send("Write a long report.");
+
+setTimeout(() => {
+  session.abort("User clicked stop");
+}, 500);
+
+const result = await pending;
+console.log(result.aborted, result.text);
+```
+
+On abort, completed step messages and the in-progress assistant text/tool calls
+are salvaged into replayable model messages. Tool calls without results receive
+a synthetic interrupted tool result.
+
+## Local Development
+
+```sh
+pnpm install
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+Run the demo harness with a real OpenRouter key:
+
+```sh
+OPENROUTER_API_KEY=... pnpm dev:send-message -- "What's the weather in Tokyo?"
+```
