@@ -31,9 +31,9 @@ describe("createOpenRouter", () => {
 		else process.env.OPENROUTER_API_KEY = ORIGINAL_KEY;
 	});
 
-	it("defaults the apiKey to OPENROUTER_API_KEY", () => {
+	it("does not touch apiKey — leaves env handling to the upstream factory", () => {
 		createOpenRouter();
-		expect(lastCall().apiKey).toBe("env-key");
+		expect("apiKey" in lastCall()).toBe(false);
 	});
 
 	it("turns on usage accounting by default", () => {
@@ -41,7 +41,7 @@ describe("createOpenRouter", () => {
 		expect(lastCall().extraBody?.usage).toEqual({ include: true });
 	});
 
-	it("lets an explicit apiKey win over the env var", () => {
+	it("forwards an explicit apiKey unchanged", () => {
 		createOpenRouter({ apiKey: "explicit-key" });
 		expect(lastCall().apiKey).toBe("explicit-key");
 	});

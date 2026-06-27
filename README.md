@@ -35,7 +35,7 @@ Works in TypeScript and JavaScript, ESM and CommonJS.
 import { streamText } from "ai";
 import { createOpenRouter, logStream } from "@merkie/agentic";
 
-// Reads OPENROUTER_API_KEY from the environment and turns on usage tracking.
+// Behaves exactly like the upstream factory, just with usage tracking on.
 const openrouter = createOpenRouter();
 
 const result = streamText({
@@ -56,20 +56,19 @@ const { createOpenRouter, logStream } = require("@merkie/agentic");
 
 ### `createOpenRouter(settings?)`
 
-Same signature and return type as `createOpenRouter` from
-`@openrouter/ai-sdk-provider`, with two defaults applied:
+Same signature, return type, and defaults as `createOpenRouter` from
+`@openrouter/ai-sdk-provider` (including reading `OPENROUTER_API_KEY` from the
+environment). The **only** thing added:
 
 | Default | Behavior | Override |
 | --- | --- | --- |
-| `apiKey` | Falls back to `process.env.OPENROUTER_API_KEY` | Pass `apiKey` |
 | `extraBody.usage.include` | `true` (returns cost + token usage) | Pass `extraBody.usage` |
 
-Every option you pass wins over the defaults, so it's 1:1 compatible with the
+Every option you pass wins over that default, so it's 1:1 compatible with the
 upstream factory:
 
 ```ts
 const openrouter = createOpenRouter({
-  apiKey: myKey,
   extraBody: {
     transforms: ["middle-out"],
     usage: { include: false }, // opt back out if you want
