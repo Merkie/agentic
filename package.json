@@ -1,17 +1,17 @@
 {
-  "name": "agentlib",
+  "name": "@merkie/agentic",
   "version": "0.1.0",
   "description": "Batteries-included helpers for building LLM-powered apps with the Vercel AI SDK and OpenRouter — automatic cost/usage tracking and pretty stream logging out of the box.",
   "type": "module",
   "license": "MIT",
   "author": "Merkie <archercalder@gmail.com>",
-  "homepage": "https://github.com/Merkie/agentlib#readme",
+  "homepage": "https://github.com/Merkie/agentic#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Merkie/agentlib.git"
+    "url": "git+https://github.com/Merkie/agentic.git"
   },
   "bugs": {
-    "url": "https://github.com/Merkie/agentlib/issues"
+    "url": "https://github.com/Merkie/agentic/issues"
   },
   "keywords": [
     "ai",
@@ -43,6 +43,9 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsup",

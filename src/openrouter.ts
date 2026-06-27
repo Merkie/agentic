@@ -21,7 +21,7 @@ import {
  *
  * @example
  * ```ts
- * import { createOpenRouter } from "agentlib";
+ * import { createOpenRouter } from "@merkie/agentic";
  *
  * // Reads OPENROUTER_API_KEY from the environment, usage tracking on.
  * const openrouter = createOpenRouter();

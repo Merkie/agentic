@@ -161,7 +161,7 @@ function formatContextUsage(
  * @example
  * ```ts
  * import { streamText } from "ai";
- * import { createOpenRouter, logStream } from "agentlib";
+ * import { createOpenRouter, logStream } from "@merkie/agentic";
  *
  * const openrouter = createOpenRouter();
  *

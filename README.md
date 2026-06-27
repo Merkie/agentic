@@ -1,8 +1,8 @@
-# agentlib
+# @merkie/agentic
 
 > Batteries-included helpers for building LLM-powered apps with the [Vercel AI SDK](https://sdk.vercel.ai) and [OpenRouter](https://openrouter.ai).
 
-Most AI SDK setups are bring-your-own-everything. `agentlib` is the start of a
+Most AI SDK setups are bring-your-own-everything. `@merkie/agentic` is the start of a
 framework that ships the boring-but-essential plumbing — observability,
 persistence, and resilience — so you can focus on your agent code instead of
 copy-pasting the same cost-tracking and logging boilerplate into every project.
@@ -21,7 +21,7 @@ This first release ships two things:
 ## Install
 
 ```bash
-npm install agentlib ai @openrouter/ai-sdk-provider
+npm install @merkie/agentic ai @openrouter/ai-sdk-provider
 ```
 
 `ai` and `@openrouter/ai-sdk-provider` are peer dependencies — you bring the
@@ -33,7 +33,7 @@ Works in TypeScript and JavaScript, ESM and CommonJS.
 
 ```ts
 import { streamText } from "ai";
-import { createOpenRouter, logStream } from "agentlib";
+import { createOpenRouter, logStream } from "@merkie/agentic";
 
 // Reads OPENROUTER_API_KEY from the environment and turns on usage tracking.
 const openrouter = createOpenRouter();
@@ -49,7 +49,7 @@ await logStream(result.fullStream);
 CommonJS:
 
 ```js
-const { createOpenRouter, logStream } = require("agentlib");
+const { createOpenRouter, logStream } = require("@merkie/agentic");
 ```
 
 ## API
