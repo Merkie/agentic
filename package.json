@@ -1,0 +1,70 @@
+{
+  "name": "agentlib",
+  "version": "0.1.0",
+  "description": "Batteries-included helpers for building LLM-powered apps with the Vercel AI SDK and OpenRouter — automatic cost/usage tracking and pretty stream logging out of the box.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Merkie <archercalder@gmail.com>",
+  "homepage": "https://github.com/Merkie/agentlib#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Merkie/agentlib.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Merkie/agentlib/issues"
+  },
+  "keywords": [
+    "ai",
+    "llm",
+    "agent",
+    "agents",
+    "openrouter",
+    "vercel-ai-sdk",
+    "ai-sdk",
+    "observability",
+    "cost-tracking",
+    "usage-tracking",
+    "streaming"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "chalk": "^5.6.2"
+  },
+  "peerDependencies": {
+    "@openrouter/ai-sdk-provider": ">=2",
+    "ai": ">=5"
+  },
+  "devDependencies": {
+    "@openrouter/ai-sdk-provider": "2.3.3",
+    "@types/node": "22.15.0",
+    "ai": "6.0.160",
+    "tsup": "^8.5.0",
+    "typescript": "5.4.5",
+    "vitest": "^3.2.4"
+  }
+}
