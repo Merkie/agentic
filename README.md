@@ -46,6 +46,25 @@ const result = streamText({
 await logStream(result.fullStream);
 ```
 
+## Local Playground
+
+This repo includes an internal `playground/` folder for trying the package in a
+real AI SDK flow without publishing or installing from npm.
+
+```bash
+npm run playground
+```
+
+That command imports directly from `src/`, so edits are picked up immediately.
+To test the built package shape that consumers get through the package exports:
+
+```bash
+npm run playground:dist
+```
+
+The playground is intentionally outside `src/`, and `package.json` publishes
+only `dist`, `README.md`, and `LICENSE`.
+
 CommonJS:
 
 ```js

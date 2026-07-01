@@ -50,9 +50,13 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
+    "playground": "tsx playground/index.ts",
+    "playground:watch": "tsx watch playground/index.ts",
+    "playground:dist": "npm run build && tsx playground/index.dist.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "typecheck:playground": "npm run build && tsc --noEmit -p tsconfig.playground.json",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
@@ -66,8 +70,14 @@
     "@openrouter/ai-sdk-provider": "2.3.3",
     "@types/node": "22.15.0",
     "ai": "6.0.160",
+    "dotenv": "^17.3.1",
     "tsup": "^8.5.0",
+    "tsx": "^4.22.4",
     "typescript": "5.4.5",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "zod": "^4.4.3"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
   }
 }
