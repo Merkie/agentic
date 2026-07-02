@@ -90,9 +90,7 @@ export function sanitizeConversation<T extends ModelMessageLike>(
 	for (let i = 0; i < cleaned.length; i += 1) {
 		const msg = cleaned[i];
 		const parts = partsOf(msg);
-		const callIds = parts
-			.filter((p) => p?.type === "tool-call")
-			.map((p) => p.toolCallId as string);
+		const callIds = parts.filter((p) => p?.type === "tool-call").map((p) => p.toolCallId as string);
 
 		if (msg?.role === "assistant" && callIds.length > 0) {
 			const followers: number[] = [];
@@ -129,9 +127,7 @@ export function sanitizeConversation<T extends ModelMessageLike>(
 				});
 				if (fKept.length > 0) {
 					out.push(
-						fKept.length === fParts.length
-							? cleaned[f]
-							: ({ ...cleaned[f], content: fKept } as T),
+						fKept.length === fParts.length ? cleaned[f] : ({ ...cleaned[f], content: fKept } as T),
 					);
 				}
 			}
@@ -154,7 +150,7 @@ export function sanitizeConversation<T extends ModelMessageLike>(
 			continue;
 		}
 
-		if (Array.isArray(msg?.content) && (msg!.content as unknown[]).length === 0) {
+		if (Array.isArray(msg?.content) && (msg.content as unknown[]).length === 0) {
 			continue;
 		}
 

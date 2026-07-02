@@ -187,7 +187,10 @@ export function serializeError(err: unknown): SerializedError {
 				typeof anyErr.message === "string" && anyErr.message.trim()
 					? anyErr.message
 					: safeStringify(err),
-			status: typeof anyErr.code === "number" || typeof anyErr.code === "string" ? anyErr.code : undefined,
+			status:
+				typeof anyErr.code === "number" || typeof anyErr.code === "string"
+					? anyErr.code
+					: undefined,
 			detail: safeDetail(err),
 		};
 	}

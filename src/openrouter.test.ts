@@ -66,8 +66,6 @@ describe("createOpenRouter", () => {
 
 	it("forwards arbitrary settings unchanged", () => {
 		createOpenRouter({ baseURL: "https://example.com" } as never);
-		expect((lastCall() as Record<string, unknown>).baseURL).toBe(
-			"https://example.com",
-		);
+		expect((lastCall() as Record<string, unknown>).baseURL).toBe("https://example.com");
 	});
 });

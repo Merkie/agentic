@@ -1,14 +1,14 @@
 import type { LanguageModel, ModelMessage, TextStreamPart, ToolSet } from "ai";
 import { tool } from "ai";
-import { z, type ZodType } from "zod";
+import { type ZodType, z } from "zod";
 import { resolveRetryConfig, retryDelayMs, wait } from "./backoff.js";
 import { classifyFailure, serializeError } from "./failure.js";
 import { getContextWindow } from "./modelMeta.js";
 import { createOpenRouter } from "./openrouter.js";
 import { replaySession } from "./replay.js";
 import { createResilientFetch, type ResilientFetchOptions } from "./resilientFetch.js";
-import { fileStorage } from "./storage.js";
 import { runLoop } from "./run.js";
+import { fileStorage } from "./storage.js";
 import type {
 	AgentConfig,
 	EventListener,
@@ -435,7 +435,11 @@ export async function withRetries<T>(
 			return await fn();
 		} catch (err) {
 			const cls = classifyFailure(err);
-			if (cls.kind !== "transient" || attempt >= retry.maxAttempts || options.abortSignal?.aborted) {
+			if (
+				cls.kind !== "transient" ||
+				attempt >= retry.maxAttempts ||
+				options.abortSignal?.aborted
+			) {
 				throw err;
 			}
 			attempt += 1;

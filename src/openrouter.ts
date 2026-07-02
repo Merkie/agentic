@@ -27,9 +27,7 @@ import {
  * const model = openrouter("openai/gpt-4o-mini");
  * ```
  */
-export function createOpenRouter(
-	settings: OpenRouterProviderSettings = {},
-): OpenRouterProvider {
+export function createOpenRouter(settings: OpenRouterProviderSettings = {}): OpenRouterProvider {
 	const { extraBody, ...rest } = settings;
 
 	const userUsage =

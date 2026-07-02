@@ -39,9 +39,9 @@ export function extractStepUsage(step: {
 	providerMetadata?: Record<string, unknown>;
 }): StepUsage {
 	const usage = step.usage;
-	const meta = (step.providerMetadata as
-		| { openrouter?: { usage?: OpenRouterUsageMeta } }
-		| undefined)?.openrouter?.usage;
+	const meta = (
+		step.providerMetadata as { openrouter?: { usage?: OpenRouterUsageMeta } } | undefined
+	)?.openrouter?.usage;
 	const raw = (usage as { raw?: RawUsage }).raw;
 
 	const cost = meta?.cost ?? raw?.cost ?? null;

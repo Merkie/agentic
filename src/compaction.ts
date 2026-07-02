@@ -66,7 +66,9 @@ export async function runCompaction(options: {
 	// Sanitize each slice so the cut can't strand half of a tool-call/result
 	// pair on either side of the boundary.
 	const head = sanitizeConversation(messages.slice(0, messages.length - keep)).messages;
-	const tail = sanitizeConversation(keep > 0 ? messages.slice(messages.length - keep) : []).messages;
+	const tail = sanitizeConversation(
+		keep > 0 ? messages.slice(messages.length - keep) : [],
+	).messages;
 
 	const result = await generateText({
 		model: options.model,

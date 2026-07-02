@@ -2,8 +2,8 @@
 // tool-using run — the run must complete anyway via classify + backoff +
 // replay-from-storage, with every finished step preserved.
 import "dotenv/config";
-import { z } from "zod";
 import { tool } from "ai";
+import { z } from "zod";
 import { createAgentic, memoryStorage } from "../../src/index.js";
 
 let requestCount = 0;
@@ -11,10 +11,13 @@ const chaosFetch: typeof fetch = async (input, init) => {
 	requestCount++;
 	if (requestCount === 2) {
 		console.log(`  [chaos] request #${requestCount}: returning 500`);
-		return new Response(JSON.stringify({ error: { message: "simulated provider meltdown", code: 500 } }), {
-			status: 500,
-			headers: { "content-type": "application/json" },
-		});
+		return new Response(
+			JSON.stringify({ error: { message: "simulated provider meltdown", code: 500 } }),
+			{
+				status: 500,
+				headers: { "content-type": "application/json" },
+			},
+		);
 	}
 	const res = await fetch(input, init);
 	if (requestCount === 3 && res.body) {
@@ -44,9 +47,13 @@ const agentic = createAgentic({
 	fetchTimeouts: { fetch: chaosFetch },
 	onEvent: (e) => {
 		if (e.type === "step")
-			console.log(`  [step] ${e.finishReason} tools=${e.toolCalls.map((t) => t.toolName).join(",") || "-"}`);
+			console.log(
+				`  [step] ${e.finishReason} tools=${e.toolCalls.map((t) => t.toolName).join(",") || "-"}`,
+			);
 		else if (e.type === "retry")
-			console.log(`  [retry ${e.attempt}/${e.maxAttempts}] wait ${e.delayMs}ms — ${e.error.message?.slice(0, 80)}`);
+			console.log(
+				`  [retry ${e.attempt}/${e.maxAttempts}] wait ${e.delayMs}ms — ${e.error.message?.slice(0, 80)}`,
+			);
 		else if (e.type === "run-end") console.log(`  [run-end] ${e.status}`);
 	},
 });

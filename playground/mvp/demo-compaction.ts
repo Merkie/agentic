@@ -15,7 +15,8 @@ const agentic = createAgentic({
 			console.log(`  [step] context=${(e.usage.inputTokens ?? 0) + (e.usage.outputTokens ?? 0)}t`);
 		else if (e.type === "compaction")
 			console.log(`  [COMPACTION] before=${e.beforeTokens}t summary=${e.summaryChars} chars`);
-		else if (e.type === "run-end") console.log(`  [run-end] ${e.status} $${e.totals.cost.toFixed(6)}`);
+		else if (e.type === "run-end")
+			console.log(`  [run-end] ${e.status} $${e.totals.cost.toFixed(6)}`);
 	},
 });
 
@@ -26,7 +27,9 @@ const session = agentic.session("compaction-demo", {
 });
 
 console.log("turn 1 (establish a fact to remember)");
-await session.send("My dog's name is Biscuit and my favorite number is 42. Tell me a fun fact about dogs.");
+await session.send(
+	"My dog's name is Biscuit and my favorite number is 42. Tell me a fun fact about dogs.",
+);
 console.log("turn 2 (bulk up the context)");
 await session.send("Give me a detailed 400-word explanation of how sourdough starter works.");
 console.log("turn 3 (more bulk)");

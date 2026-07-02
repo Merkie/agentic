@@ -4,8 +4,8 @@
 // resumes the SAME run to completion from the last persisted step.
 import "dotenv/config";
 import { spawn } from "node:child_process";
-import { z } from "zod";
 import { tool } from "ai";
+import { z } from "zod";
 import { createAgentic, fileStorage } from "../../src/index.js";
 
 const DIR = "./playground/mvp/.restart-demo";
@@ -16,7 +16,9 @@ function buildAgentic() {
 		storage: fileStorage(DIR),
 		onEvent: (e) => {
 			if (e.type === "step")
-				console.log(`  [step] ${e.finishReason} tools=${e.toolCalls.map((t) => t.toolName).join(",") || "-"}`);
+				console.log(
+					`  [step] ${e.finishReason} tools=${e.toolCalls.map((t) => t.toolName).join(",") || "-"}`,
+				);
 			else if (e.type === "run-end") console.log(`  [run-end] ${e.status}`);
 		},
 	});
@@ -58,7 +60,9 @@ if (phase === "start") {
 	console.log(`\nRESUMED RESULT: ${result.status}`);
 	console.log(`TEXT: ${result.text.slice(0, 300)}`);
 	const stats = await session.stats();
-	console.log(`lifetime: ${stats.steps} steps, $${stats.cost.toFixed(6)}, context ${stats.contextTokens} tokens`);
+	console.log(
+		`lifetime: ${stats.steps} steps, $${stats.cost.toFixed(6)}, context ${stats.contextTokens} tokens`,
+	);
 	process.exit(result.status === "completed" ? 0 : 1);
 } else {
 	// orchestrate: start child, SIGKILL it mid-run, then resume in a new process
@@ -72,7 +76,8 @@ if (phase === "start") {
 		detached: true,
 	});
 	await new Promise((r) => setTimeout(r, 8_000));
-	process.kill(-child.pid!, "SIGKILL");
+	if (!child.pid) throw new Error("child process failed to spawn");
+	process.kill(-child.pid, "SIGKILL");
 	console.log("── KILLED mid-run (simulated crash/deploy) ──");
 	await new Promise((r) => setTimeout(r, 500));
 	console.log("── phase 2: new process resumes from storage ──");

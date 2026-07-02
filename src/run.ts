@@ -7,11 +7,7 @@ import {
 	type ToolSet,
 } from "ai";
 import { resolveRetryConfig, retryDelayMs, wait } from "./backoff.js";
-import {
-	resolveCompactionConfig,
-	runCompaction,
-	shouldCompact,
-} from "./compaction.js";
+import { resolveCompactionConfig, runCompaction, shouldCompact } from "./compaction.js";
 import { classifyFailure, serializeError } from "./failure.js";
 import { getContextWindow } from "./modelMeta.js";
 import { replaySession } from "./replay.js";
@@ -192,8 +188,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// ── compaction before the pass (threshold crossed, or forced by an
 		// overflow error) ──
 		const wantCompaction =
-			forceCompact ||
-			shouldCompact(replayed.contextTokens, contextWindow, compaction.limit);
+			forceCompact || shouldCompact(replayed.contextTokens, contextWindow, compaction.limit);
 		if (wantCompaction) {
 			const compacted = await compactNow();
 			if (compacted.outcome === "done") {
@@ -272,16 +267,20 @@ export async function runLoop<TOOLS extends ToolSet>(
 					providerMetadata: step.providerMetadata as Record<string, unknown> | undefined,
 				});
 				const newMessages = step.response.messages.slice();
-				pendingAppends.push(Promise.resolve(append({
-					type: "step",
-					at: now(),
-					runId,
-					messages: agent.preserveProviderOptions
-						? newMessages
-						: stripProviderOptions(newMessages),
-					finishReason: step.finishReason,
-					usage,
-				})));
+				pendingAppends.push(
+					Promise.resolve(
+						append({
+							type: "step",
+							at: now(),
+							runId,
+							messages: agent.preserveProviderOptions
+								? newMessages
+								: stripProviderOptions(newMessages),
+							finishReason: step.finishReason,
+							usage,
+						}),
+					),
+				);
 				totals = addStepToTotals(totals, usage);
 				lastFinishReason = step.finishReason;
 				if (step.text.trim()) finalText = step.text;
@@ -376,8 +375,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 					),
 				);
 			}
-			const content =
-				options.pokeMessage?.(pokes) ?? DEFAULT_POKE(pokes === maxPokes);
+			const content = options.pokeMessage?.(pokes) ?? DEFAULT_POKE(pokes === maxPokes);
 			await append({
 				type: "user-message",
 				at: now(),

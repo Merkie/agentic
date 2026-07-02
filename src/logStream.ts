@@ -22,9 +22,7 @@ const openRouterContextLengthCache = new Map<string, Promise<number | null>>();
 function getOpenRouterCost(part: TextStreamPart<ToolSet>) {
 	if (part.type !== "finish-step") return null;
 
-	const metadataUsage = part.providerMetadata?.openrouter?.usage as
-		| OpenRouterUsageCost
-		| undefined;
+	const metadataUsage = part.providerMetadata?.openrouter?.usage as OpenRouterUsageCost | undefined;
 	const rawUsage = part.usage.raw as
 		| {
 				cost?: number;
@@ -79,9 +77,7 @@ function getOpenRouterContextLengthFromResponse(payload: unknown) {
 
 async function fetchOpenRouterContextLength(modelId: string) {
 	const pathModelId = modelId.split("/").map(encodeURIComponent).join("/");
-	const response = await fetch(
-		`https://openrouter.ai/api/v1/model/${pathModelId}`,
-	);
+	const response = await fetch(`https://openrouter.ai/api/v1/model/${pathModelId}`);
 
 	if (!response.ok) {
 		return null;
@@ -144,8 +140,7 @@ function formatContextUsage(
 	}
 
 	const percentage = (tokens / contextWindowTokens) * 100;
-	const formattedPercentage =
-		percentage > 0 && percentage < 0.01 ? "<0.01" : percentage.toFixed(2);
+	const formattedPercentage = percentage > 0 && percentage < 0.01 ? "<0.01" : percentage.toFixed(2);
 
 	return `${formattedPercentage}% context used (${formatTokens(tokens)} / ${formatTokens(contextWindowTokens)} tokens)`;
 }
@@ -173,9 +168,7 @@ function formatContextUsage(
  * await logStream(result.fullStream);
  * ```
  */
-export async function logStream(
-	stream: AsyncIterable<TextStreamPart<ToolSet>>,
-): Promise<void> {
+export async function logStream(stream: AsyncIterable<TextStreamPart<ToolSet>>): Promise<void> {
 	// Track which "channel" (reasoning vs. text) we're currently writing to so we
 	// only print a header when it changes, and stream deltas onto the same line.
 	let active: "reasoning" | "text" | null = null;
@@ -250,8 +243,7 @@ export async function logStream(
 			case "tool-error":
 				endActive();
 				console.log(
-					chalk.red.bold(`❌ tool error ${part.toolName} `) +
-						chalk.red(String(part.error)),
+					chalk.red.bold(`❌ tool error ${part.toolName} `) + chalk.red(String(part.error)),
 				);
 				break;
 
@@ -262,9 +254,7 @@ export async function logStream(
 
 			case "finish": {
 				endActive();
-				const contextWindowTokens = contextWindowPromise
-					? await contextWindowPromise
-					: null;
+				const contextWindowTokens = contextWindowPromise ? await contextWindowPromise : null;
 				console.log(
 					chalk.dim(
 						`\n── done (${part.finishReason}) · ${formatContextUsage(latestStepUsage, contextWindowTokens)}${hasOpenRouterCost ? ` · cost ${formatCost(openRouterCost)}` : ""} ──`,

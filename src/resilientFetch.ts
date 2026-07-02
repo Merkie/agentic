@@ -53,18 +53,15 @@ async function readWithTimeout(
 	}
 }
 
-function wrapSseBody(
-	response: Response,
-	ms: number,
-	idleController: AbortController,
-): Response {
-	if (!response.body || ms <= 0) return response;
+function wrapSseBody(response: Response, ms: number, idleController: AbortController): Response {
+	const sourceBody = response.body;
+	if (!sourceBody || ms <= 0) return response;
 	const contentType = response.headers.get("content-type") ?? "";
 	if (!contentType.toLowerCase().includes("text/event-stream")) return response;
 
 	const body = new ReadableStream<Uint8Array>({
 		async start(controller) {
-			const reader = response.body!.getReader();
+			const reader = sourceBody.getReader();
 			try {
 				while (true) {
 					const chunk = await readWithTimeout(reader, ms);

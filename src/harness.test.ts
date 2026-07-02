@@ -24,12 +24,18 @@ describe("classifyFailure", () => {
 		expect(classifyFailure(new Error("502 Upstream idle timeout exceeded")).kind).toBe("transient");
 		expect(classifyFailure(new Error("ECONNRESET: socket hang up")).kind).toBe("transient");
 		expect(classifyFailure({ message: "Rate limit exceeded", code: 429 }).kind).toBe("transient");
-		expect(classifyFailure(new Error("No output generated. Check the stream for errors.")).kind).toBe("transient");
+		expect(
+			classifyFailure(new Error("No output generated. Check the stream for errors.")).kind,
+		).toBe("transient");
 	});
 
 	it("classifies context overflow as its own kind, not transient", () => {
-		expect(classifyFailure(new Error("This model's maximum context length is 65536 tokens")).kind).toBe("context-overflow");
-		expect(classifyFailure(new Error("prompt is too long: 210000 tokens")).kind).toBe("context-overflow");
+		expect(
+			classifyFailure(new Error("This model's maximum context length is 65536 tokens")).kind,
+		).toBe("context-overflow");
+		expect(classifyFailure(new Error("prompt is too long: 210000 tokens")).kind).toBe(
+			"context-overflow",
+		);
 	});
 
 	it("does not confuse rate limits with overflow", () => {
@@ -37,14 +43,24 @@ describe("classifyFailure", () => {
 	});
 
 	it("classifies billing/auth/malformed as fatal", () => {
-		expect(classifyFailure(new Error("This request requires more credits, or fewer max_tokens")).kind).toBe("fatal");
+		expect(
+			classifyFailure(new Error("This request requires more credits, or fewer max_tokens")).kind,
+		).toBe("fatal");
 		expect(classifyFailure(new Error("Invalid API key")).kind).toBe("fatal");
-		expect(classifyFailure(new Error("[Xiaomi] Param Incorrect: messages[3].tool_calls[0] is missing a function name")).kind).toBe("fatal");
+		expect(
+			classifyFailure(
+				new Error("[Xiaomi] Param Incorrect: messages[3].tool_calls[0] is missing a function name"),
+			).kind,
+		).toBe("fatal");
 	});
 
 	it("prefers OpenRouter's typed error code when present", () => {
-		expect(classifyFailure({ message: "x", metadata: { error_type: "provider_overloaded" } }).kind).toBe("transient");
-		expect(classifyFailure({ message: "x", metadata: { error_type: "content_policy_violation" } }).kind).toBe("fatal");
+		expect(
+			classifyFailure({ message: "x", metadata: { error_type: "provider_overloaded" } }).kind,
+		).toBe("transient");
+		expect(
+			classifyFailure({ message: "x", metadata: { error_type: "content_policy_violation" } }).kind,
+		).toBe("fatal");
 	});
 
 	it("extracts Retry-After for transient failures", () => {
@@ -131,7 +147,11 @@ describe("sanitizeConversation", () => {
 describe("memoryStorage", () => {
 	it("appends and loads in order", async () => {
 		const storage = memoryStorage();
-		await storage.append("s", { type: "user-message", at: "t", message: { role: "user", content: "1" } });
+		await storage.append("s", {
+			type: "user-message",
+			at: "t",
+			message: { role: "user", content: "1" },
+		});
 		await storage.append("s", { type: "run-start", at: "t", runId: "r", model: "m" });
 		const events = await storage.load("s");
 		expect(events.map((e) => e.type)).toEqual(["user-message", "run-start"]);

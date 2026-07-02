@@ -43,7 +43,10 @@ export function fileStorage(dir = "./.agentic"): StorageProvider {
 			const prev = appendChains.get(sessionId) ?? Promise.resolve();
 			const next = prev.then(() => fsp.appendFile(file, `${JSON.stringify(event)}\n`, "utf8"));
 			// Keep the chain alive after a failed write so later appends still run.
-			appendChains.set(sessionId, next.catch(() => {}));
+			appendChains.set(
+				sessionId,
+				next.catch(() => {}),
+			);
 			return next;
 		},
 		async load(sessionId) {
@@ -71,7 +74,11 @@ export function fileStorage(dir = "./.agentic"): StorageProvider {
 			const names = await fsp.readdir(dir);
 			return names
 				.filter((n) => n.endsWith(".jsonl"))
-				.map((n) => n.slice(0, -".jsonl".length).replace(/%([0-9a-f]{2})/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16))));
+				.map((n) =>
+					n
+						.slice(0, -".jsonl".length)
+						.replace(/%([0-9a-f]{2})/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16))),
+				);
 		},
 	};
 }

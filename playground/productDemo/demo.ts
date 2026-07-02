@@ -11,10 +11,7 @@ type AgenticApi = {
 	logStream: typeof logStreamSource;
 };
 
-export async function runProductDemo({
-	createOpenRouter,
-	logStream,
-}: AgenticApi) {
+export async function runProductDemo({ createOpenRouter, logStream }: AgenticApi) {
 	const openrouter = createOpenRouter();
 
 	const result = streamText({

@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TextStreamPart, ToolSet } from "ai";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { logStream } from "./logStream.js";
 
 // Force chalk to emit plain strings so assertions don't have to match ANSI codes.
@@ -21,12 +21,10 @@ describe("logStream", () => {
 		logSpy = vi.spyOn(console, "log").mockImplementation((...args) => {
 			out += `${args.join(" ")}\n`;
 		});
-		writeSpy = vi
-			.spyOn(process.stdout, "write")
-			.mockImplementation((chunk: unknown) => {
-				out += String(chunk);
-				return true;
-			});
+		writeSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+			out += String(chunk);
+			return true;
+		});
 		// Avoid real network calls for context-window lookups.
 		vi.stubGlobal(
 			"fetch",

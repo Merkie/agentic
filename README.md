@@ -106,8 +106,6 @@ Everything the harness is built from is exported for use with plain
 | `extractStepUsage` | per-step tokens + BYOK-reconciled cost from provider metadata |
 | `getContextWindow` | a model's context length from OpenRouter, memoized |
 
-See [DESIGN.md](./DESIGN.md) for the architecture and the reasoning behind it.
-
 ## Local playground
 
 `playground/mvp/` has runnable proof demos (bring an `OPENROUTER_API_KEY` in

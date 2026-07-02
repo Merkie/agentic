@@ -36,7 +36,7 @@ class StreamStallError extends Error {
 	override name = "StreamStallError";
 }
 function resilientFetch(headerMs = 60_000, chunkMs = 120_000): typeof fetch {
-	return (async (input: RequestInfo | URL, init?: RequestInit) => {
+	return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
 		const headerCtl = new AbortController();
 		const headerTimer = setTimeout(
 			() => headerCtl.abort(new HeaderTimeoutError("headers timed out")),
@@ -46,7 +46,8 @@ function resilientFetch(headerMs = 60_000, chunkMs = 120_000): typeof fetch {
 		try {
 			const res = await fetch(input, { ...init, signal: AbortSignal.any(signals) });
 			clearTimeout(headerTimer);
-			if (!res.body || !(res.headers.get("content-type") ?? "").includes("event-stream")) return res;
+			if (!res.body || !(res.headers.get("content-type") ?? "").includes("event-stream"))
+				return res;
 			const reader = res.body.getReader();
 			const body = new ReadableStream<Uint8Array>({
 				async pull(controller) {
@@ -76,11 +77,33 @@ function resilientFetch(headerMs = 60_000, chunkMs = 120_000): typeof fetch {
 }
 
 // ── plumbing layer 2: transient-vs-fatal error classifier ────────────────
-const TRANSIENT_NEEDLES = ["econnreset", "socket hang up", "timeout", "timed out", "overloaded",
-	"bad gateway", "service unavailable", "rate limit", "too many requests", "internal server error",
-	"upstream idle", "provider returned", "no output generated", "fetch failed", "terminated"];
-const FATAL_NEEDLES = ["credits", "payment required", "billing", "invalid api key", "unauthorized",
-	"content policy", "param incorrect", "invalid_request"];
+const TRANSIENT_NEEDLES = [
+	"econnreset",
+	"socket hang up",
+	"timeout",
+	"timed out",
+	"overloaded",
+	"bad gateway",
+	"service unavailable",
+	"rate limit",
+	"too many requests",
+	"internal server error",
+	"upstream idle",
+	"provider returned",
+	"no output generated",
+	"fetch failed",
+	"terminated",
+];
+const FATAL_NEEDLES = [
+	"credits",
+	"payment required",
+	"billing",
+	"invalid api key",
+	"unauthorized",
+	"content policy",
+	"param incorrect",
+	"invalid_request",
+];
 function isTransient(err: unknown): boolean {
 	let s: string;
 	try {
@@ -143,8 +166,13 @@ function sanitize(messages: ModelMessage[]): ModelMessage[] {
 // ── plumbing layer 5: usage/cost accounting (BYOK vs credits) ────────────
 let totalCost = 0;
 function trackCost(providerMetadata: unknown) {
-	const u = (providerMetadata as { openrouter?: { usage?: { cost?: number; costDetails?: { upstreamInferenceCost?: number | null } } } })
-		?.openrouter?.usage;
+	const u = (
+		providerMetadata as {
+			openrouter?: {
+				usage?: { cost?: number; costDetails?: { upstreamInferenceCost?: number | null } };
+			};
+		}
+	)?.openrouter?.usage;
 	totalCost += (u?.cost ?? 0) + (u?.costDetails?.upstreamInferenceCost ?? 0);
 }
 
