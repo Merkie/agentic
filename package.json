@@ -64,7 +64,8 @@
   },
   "peerDependencies": {
     "@openrouter/ai-sdk-provider": ">=2",
-    "ai": ">=5"
+    "ai": ">=5",
+    "zod": ">=4"
   },
   "devDependencies": {
     "@openrouter/ai-sdk-provider": "2.3.3",
