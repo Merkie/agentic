@@ -1,84 +1,88 @@
 {
-  "name": "@merkie/agentic",
-  "version": "0.1.1",
-  "description": "Batteries-included helpers for building LLM-powered apps with the Vercel AI SDK and OpenRouter — automatic cost/usage tracking and pretty stream logging out of the box.",
-  "type": "module",
-  "license": "MIT",
-  "author": "Merkie <archercalder@gmail.com>",
-  "homepage": "https://github.com/Merkie/agentic#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Merkie/agentic.git"
-  },
-  "bugs": {
-    "url": "https://github.com/Merkie/agentic/issues"
-  },
-  "keywords": [
-    "ai",
-    "llm",
-    "agent",
-    "agents",
-    "openrouter",
-    "vercel-ai-sdk",
-    "ai-sdk",
-    "observability",
-    "cost-tracking",
-    "usage-tracking",
-    "streaming"
-  ],
-  "main": "./dist/index.cjs",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
-    }
-  },
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE"
-  ],
-  "engines": {
-    "node": ">=18"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
-  "scripts": {
-    "build": "tsup",
-    "dev": "tsup --watch",
-    "playground": "tsx playground/index.ts",
-    "playground:watch": "tsx watch playground/index.ts",
-    "playground:dist": "npm run build && tsx playground/index.dist.ts",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "typecheck:playground": "npm run build && tsc --noEmit -p tsconfig.playground.json",
-    "prepublishOnly": "npm run build"
-  },
-  "dependencies": {
-    "chalk": "^5.6.2"
-  },
-  "peerDependencies": {
-    "@openrouter/ai-sdk-provider": ">=2",
-    "ai": ">=5",
-    "zod": ">=4"
-  },
-  "devDependencies": {
-    "@openrouter/ai-sdk-provider": "2.3.3",
-    "@types/node": "22.15.0",
-    "ai": "6.0.160",
-    "dotenv": "^17.3.1",
-    "tsup": "^8.5.0",
-    "tsx": "^4.22.4",
-    "typescript": "5.4.5",
-    "vitest": "^3.2.4",
-    "zod": "^4.4.3"
-  },
-  "overrides": {
-    "esbuild": "0.28.1"
-  }
+	"name": "@merkie/agentic",
+	"version": "0.1.1",
+	"description": "Batteries-included helpers for building LLM-powered apps with the Vercel AI SDK and OpenRouter — automatic cost/usage tracking and pretty stream logging out of the box.",
+	"type": "module",
+	"license": "MIT",
+	"author": "Merkie <archercalder@gmail.com>",
+	"homepage": "https://github.com/Merkie/agentic#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Merkie/agentic.git"
+	},
+	"bugs": {
+		"url": "https://github.com/Merkie/agentic/issues"
+	},
+	"keywords": [
+		"ai",
+		"llm",
+		"agent",
+		"agents",
+		"openrouter",
+		"vercel-ai-sdk",
+		"ai-sdk",
+		"observability",
+		"cost-tracking",
+		"usage-tracking",
+		"streaming"
+	],
+	"main": "./dist/index.cjs",
+	"module": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"require": "./dist/index.cjs"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"engines": {
+		"node": ">=18"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"build": "tsup",
+		"dev": "tsup --watch",
+		"playground": "tsx playground/index.ts",
+		"playground:watch": "tsx watch playground/index.ts",
+		"playground:dist": "npm run build && tsx playground/index.dist.ts",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"lint": "biome check .",
+		"lint:fix": "biome check --write .",
+		"format": "biome format --write .",
+		"typecheck": "tsc --noEmit",
+		"typecheck:playground": "npm run build && tsc --noEmit -p tsconfig.playground.json",
+		"prepublishOnly": "npm run build"
+	},
+	"dependencies": {
+		"chalk": "^5.6.2"
+	},
+	"peerDependencies": {
+		"@openrouter/ai-sdk-provider": ">=2",
+		"ai": ">=5",
+		"zod": ">=4"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.5.2",
+		"@openrouter/ai-sdk-provider": "2.3.3",
+		"@types/node": "22.15.0",
+		"ai": "6.0.160",
+		"dotenv": "^17.3.1",
+		"tsup": "^8.5.0",
+		"tsx": "^4.22.4",
+		"typescript": "5.4.5",
+		"vitest": "^3.2.4",
+		"zod": "^4.4.3"
+	},
+	"overrides": {
+		"esbuild": "0.28.1"
+	}
 }
