@@ -7,3 +7,12 @@ dist/
 .vitest/
 coverage/
 playground/logs/
+
+# demo session ledgers / logs (playground runs)
+playground/mvp/.restart-demo/
+playground/mvp/before-after/.after/
+playground/mvp/before-after/.before-ledger.jsonl
+.agentic/
+
+# internal design notes
+DESIGN.md

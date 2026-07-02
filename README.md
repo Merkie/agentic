@@ -1,109 +1,133 @@
 # @merkie/agentic
 
-> Batteries-included helpers for building LLM-powered apps with the [Vercel AI SDK](https://sdk.vercel.ai) and [OpenRouter](https://openrouter.ai).
+> A resilience, storage, and observability harness for LLM agents on the
+> [Vercel AI SDK](https://sdk.vercel.ai) + [OpenRouter](https://openrouter.ai).
 
-Most AI SDK setups are bring-your-own-everything. `@merkie/agentic` is the start of a
-framework that ships the boring-but-essential plumbing — observability,
-persistence, and resilience — so you can focus on your agent code instead of
-copy-pasting the same cost-tracking and logging boilerplate into every project.
+Most AI SDK setups are bring-your-own-everything: every project re-implements
+retry loops, chat persistence, crash recovery, compaction, and cost tracking —
+slightly differently, with the same bugs. `@merkie/agentic` ships that
+plumbing once, battle-tested, so your code is just models, prompts, and tools.
 
-This first release ships two things:
+**What the harness guarantees:**
 
-- **`createOpenRouter`** — a drop-in replacement for the provider factory that
-  auto-enables usage/cost accounting and reads your API key from the
-  environment.
-- **`logStream`** — pretty-prints an AI SDK stream in real time (reasoning,
-  messages, tool calls/results) with live token and cost accounting.
-
-> **Status:** early. The logging here will eventually be backed by a real
-> persistence/observability layer; `chalk` and friends are temporary.
+- **Runs don't fail when waiting a second would have saved them.** Transient
+  provider errors (429s, 5xxs, severed SSE streams, stalled connections) are
+  classified and retried with capped exponential backoff (server `Retry-After`
+  wins). Deterministic errors — billing, auth, policy, malformed requests,
+  context overflow — fail fast instead of burning credits in a retry loop.
+- **Runs survive process restarts.** Every model step is persisted the moment
+  it finishes; the agent loop is stateless over an append-only event ledger,
+  so recovery from a SIGKILL mid-run is just "run the loop again". Bring your
+  own storage (Prisma, SQLite, Redis…) by implementing two methods; JSONL
+  file storage is built in.
+- **Workflows have guaranteed outcomes.** `task()` gives the model
+  `submit_deliverable` + `cancel_task`, validates the deliverable with zod
+  *inside the tool* (validation errors go back to the model as tool results
+  it can fix — no memoryless structured-output retries), and pokes the model
+  if it ends its turn without calling a terminal tool. You always get
+  `submitted | cancelled | failed`, never a throw.
+- **Chats outlive the context window.** Compaction triggers on real
+  provider-reported token counts against the model's actual context window
+  (fetched from OpenRouter), summarizes into a hand-off message, and keeps
+  going — silently between turns, or mid-run for agents deep in a task.
+- **Cost is tracked correctly**, including BYOK: OpenRouter credits report
+  `cost`; BYOK reports the provider charge in `upstream_inference_cost`.
+  Per-step usage/cost is persisted, aggregated per run and per session.
 
 ## Install
 
 ```bash
-npm install @merkie/agentic ai @openrouter/ai-sdk-provider
+npm install @merkie/agentic ai @openrouter/ai-sdk-provider zod
 ```
 
-`ai` and `@openrouter/ai-sdk-provider` are peer dependencies — you bring the
-versions your app already uses.
+`ai` (v6), `@openrouter/ai-sdk-provider`, and `zod` (v4) are peer
+dependencies. Reads `OPENROUTER_API_KEY` from the environment by default.
 
-Works in TypeScript and JavaScript, ESM and CommonJS.
-
-## Usage
+## The harness in 30 seconds
 
 ```ts
-import { streamText } from "ai";
-import { createOpenRouter, logStream } from "@merkie/agentic";
+import { createAgentic, fileStorage } from "@merkie/agentic";
+import { tool } from "ai";
+import { z } from "zod";
 
-// Behaves exactly like the upstream factory, just with usage tracking on.
-const openrouter = createOpenRouter();
+const agentic = createAgentic({ storage: fileStorage("./.agentic") });
 
-const result = streamText({
-  model: openrouter("openai/gpt-4o-mini"),
-  prompt: "Explain quantum tunneling in one paragraph.",
+// ── durable chat ──────────────────────────────────────────────────────
+const chat = agentic.session("chat:user-123", {
+  model: "qwen/qwen3.7-max",
+  system: "You are a helpful assistant.",
+  tools: { /* your tools */ },
+  compaction: { limit: 0.3 },          // compact at 30% of context window
 });
+const reply = await chat.send("hey!", { onPart: (p) => {/* stream to UI */} });
 
-await logStream(result.fullStream);
-```
+// after a crash/deploy, on boot:
+for (const id of await agentic.interruptedSessions()) {
+  // re-supply the agent config and pick up where the run left off
+  await agentic.session(id, myAgentFor(id)).resume();
+}
 
-## Local Playground
-
-This repo includes an internal `playground/` folder for trying the package in a
-real AI SDK flow without publishing or installing from npm.
-
-```bash
-npm run playground
-```
-
-That command imports directly from `src/`, so edits are picked up immediately.
-To test the built package shape that consumers get through the package exports:
-
-```bash
-npm run playground:dist
-```
-
-The playground is intentionally outside `src/`, and `package.json` publishes
-only `dist`, `README.md`, and `LICENSE`.
-
-CommonJS:
-
-```js
-const { createOpenRouter, logStream } = require("@merkie/agentic");
-```
-
-## API
-
-### `createOpenRouter(settings?)`
-
-Same signature, return type, and defaults as `createOpenRouter` from
-`@openrouter/ai-sdk-provider` (including reading `OPENROUTER_API_KEY` from the
-environment). The **only** thing added:
-
-| Default | Behavior | Override |
-| --- | --- | --- |
-| `extraBody.usage.include` | `true` (returns cost + token usage) | Pass `extraBody.usage` |
-
-Every option you pass wins over that default, so it's 1:1 compatible with the
-upstream factory:
-
-```ts
-const openrouter = createOpenRouter({
-  extraBody: {
-    transforms: ["middle-out"],
-    usage: { include: false }, // opt back out if you want
+// ── workflow task with a guaranteed outcome ───────────────────────────
+const outcome = await agentic.task({
+  agent: {
+    model: "qwen/qwen3.7-max",
+    system: "You are a bank task worker.",
+    tools: { get_account },
   },
+  prompt: "Look up ACC-1001's balance for its authenticated owner and submit it.",
+  deliverable: z.object({ accountId: z.string(), balance: z.number() }),
 });
+// outcome.status: "submitted" (typed deliverable) | "cancelled" (model's
+// escape hatch, with reason) | "failed" (bounded retries exhausted)
 ```
 
-### `logStream(stream)`
-
-Consumes an `AsyncIterable` of AI SDK `TextStreamPart`s (i.e. the `fullStream`
-from `streamText`) and prints each event as it arrives. When the model is served
-through `createOpenRouter`, it also reports per-run cost and context-window
-usage on completion.
+Every session — chats, workflows, one-shots — shares the same ledger, so all
+of it is resumable, auditable, and cost-tracked. Observability is one hook:
 
 ```ts
-await logStream(result.fullStream);
+createAgentic({ onEvent: (e) => log(e) })
+// run-start · step · retry · compaction · poke · run-end
+```
+
+## À-la-carte helpers
+
+Everything the harness is built from is exported for use with plain
+`streamText`/`generateText`:
+
+| Helper | What it does |
+|---|---|
+| `createOpenRouter` | drop-in provider factory with usage accounting on |
+| `logStream` | pretty-print a full stream with live token/cost accounting |
+| `withRetries(fn)` | retry any model call on transient failures, fail fast on deterministic ones |
+| `classifyFailure(err)` | `transient` \| `context-overflow` \| `fatal` (+ Retry-After) |
+| `createResilientFetch` | header + SSE-idle stall detection for hung connections |
+| `sanitizeConversation` | heal interrupted/malformed tool-call transcripts before replay |
+| `guardToolResultSizes` | cap tool results so one result can't blow the context window |
+| `extractStepUsage` | per-step tokens + BYOK-reconciled cost from provider metadata |
+| `getContextWindow` | a model's context length from OpenRouter, memoized |
+
+See [DESIGN.md](./DESIGN.md) for the architecture and the reasoning behind it.
+
+## Local playground
+
+`playground/mvp/` has runnable proof demos (bring an `OPENROUTER_API_KEY` in
+`.env`):
+
+```bash
+npx tsx playground/mvp/demo-task.ts        # schema self-heal + guaranteed outcome
+npx tsx playground/mvp/demo-chaos.ts       # injected 500s + severed SSE mid-run
+npx tsx playground/mvp/demo-restart.ts     # SIGKILL mid-run → resume in new process
+npx tsx playground/mvp/demo-compaction.ts  # memory survives two compactions
+npx tsx playground/mvp/before-after/before.ts  # the plumbing you'd write by hand
+npx tsx playground/mvp/before-after/after.ts   # the same workflow on the harness
+```
+
+## Development
+
+```bash
+npm test          # vitest
+npm run typecheck
+npm run build     # tsup → dist/
 ```
 
 ## License
