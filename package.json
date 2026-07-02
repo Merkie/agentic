@@ -1,6 +1,6 @@
 {
 	"name": "@merkie/agentic",
-	"version": "0.1.1",
+	"version": "0.2.0",
 	"description": "Batteries-included helpers for building LLM-powered apps with the Vercel AI SDK and OpenRouter — automatic cost/usage tracking and pretty stream logging out of the box.",
 	"type": "module",
 	"license": "MIT",
