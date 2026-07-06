@@ -8,12 +8,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import { createAgentic, fileStorage } from "../src/index.js";
 
-const agentic = createAgentic({
-	storage: fileStorage("./.agentic"), // JSONL ledgers, one file per session
-	logs: true, // one colored console line per run/step/retry/compaction event
-});
-
-const chat = agentic.session("chat:demo-user", {
+const assistant = {
 	model: "xiaomi/mimo-v2.5",
 	system: "You are a helpful assistant. Keep answers short.",
 	tools: {
@@ -24,13 +19,18 @@ const chat = agentic.session("chat:demo-user", {
 		}),
 	},
 	compaction: { limit: 0.3 }, // summarize at 30% of the context window
+};
+
+const agentic = createAgentic({
+	storage: fileStorage("./.agentic"), // JSONL ledgers, one file per session
+	logs: true, // one colored console line per run/step/retry/compaction event
+	// Crash recovery that just works: on boot the harness sweeps storage for
+	// work a previous process left behind (interrupted runs, unanswered queued
+	// messages) and resumes it — this resolver re-supplies each session's config.
+	autoResume: () => assistant,
 });
 
-// After a crash or deploy, pick up any work a previous process left behind
-// (interrupted runs, queued messages that never got an answer).
-for (const id of await agentic.interruptedSessions()) {
-	await agentic.session(id, { model: "xiaomi/mimo-v2.5" }).resume();
-}
+const chat = agentic.session("chat:demo-user", assistant);
 
 const reply = await chat.send("What time is it right now?", {
 	onPart: (part) => {

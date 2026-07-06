@@ -29,7 +29,8 @@ recovery, resume, message queueing, and auditing all fall out of this.
 - `src/agentic.ts` — public API: `createAgentic()` → `session()` (durable
   chat: `send`/`resume`/`messages`/`isInterrupted`), `task()`
   (guaranteed-outcome workflows via `submit_deliverable`/`cancel_task`
-  tools), `withRetries()`. Holds per-session locks and the live-run map.
+  tools), `withRetries()`, `resumeInterrupted()` (the auto-resume sweep).
+  Holds per-session locks and the live-run map.
 - `src/run.ts` — `runLoop()`, the heart: replay ledger → streamText → persist
   steps → repeat. Owns retries (via `classifyFailure`), mid-run compaction,
   poking, and the `RunMailbox` for live message queueing.
@@ -71,6 +72,19 @@ the message in. Key invariants, in `src/run.ts`:
 - Replay counts trailing unanswered messages (`pendingMessages`) so
   `resume()`/`interruptedSessions()` recover queued messages orphaned by a
   crash — but any `run-end` clears them (don't auto-re-run an abort/failure).
+
+### Auto-resume (the boot sweep)
+
+`createAgentic({ autoResume: (sessionId) => agentConfig })` makes crash
+recovery automatic: a background sweep runs at creation (and on demand via
+`resumeInterrupted()`), finds sessions with an open run or pending queued
+messages, and re-drives them. The resolver exists because agent configs hold
+tool *functions*, which can't live in storage. Guards: every resume appends a
+`run-resume` ledger event (`auto: true` for sweep-driven ones); replay counts
+them as `autoResumeAttempts`, and the sweep gives up after `maxAttempts`
+(default 3, reset by any `run-end`) so a run that crashes the process on
+resume can't wedge a restart loop. Manual `resume()` is uncapped. Sweep kicks
+re-check under the session lock, so racing sweeps/sends never double-resume.
 
 ## Testing
 

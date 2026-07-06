@@ -15,11 +15,14 @@ plumbing once, battle-tested, so your code is just models, prompts, and tools.
   classified and retried with capped exponential backoff (server `Retry-After`
   wins). Deterministic errors — billing, auth, policy, malformed requests,
   context overflow — fail fast instead of burning credits in a retry loop.
-- **Runs survive process restarts.** Every model step is persisted the moment
-  it finishes; the agent loop is stateless over an append-only event ledger,
-  so recovery from a SIGKILL mid-run is just "run the loop again". Bring your
-  own storage (Prisma, SQLite, Redis…) by implementing two methods; JSONL
-  file storage is built in.
+- **Runs survive process restarts — automatically.** Every model step is
+  persisted the moment it finishes; the agent loop is stateless over an
+  append-only event ledger, so recovery from a SIGKILL mid-run is just "run
+  the loop again". With `autoResume` configured, the harness sweeps storage
+  on boot and re-drives interrupted work by itself, with a ledger-counted
+  attempt cap so a run that crashes the process on resume can't wedge it
+  into a restart loop. Bring your own storage (Prisma, SQLite, Redis…) by
+  implementing two methods; JSONL file storage is built in.
 - **Workflows have guaranteed outcomes.** `task()` gives the model
   `submit_deliverable` + `cancel_task`, validates the deliverable with zod
   *inside the tool* (validation errors go back to the model as tool results
@@ -55,7 +58,12 @@ import { createAgentic, fileStorage } from "@merkie/agentic";
 import { tool } from "ai";
 import { z } from "zod";
 
-const agentic = createAgentic({ storage: fileStorage("./.agentic") });
+const agentic = createAgentic({
+  storage: fileStorage("./.agentic"),
+  // crash/deploy recovery, no boot code: the harness sweeps storage for
+  // interrupted work and resumes it, using this to map ids back to configs
+  autoResume: (sessionId) => myAgentFor(sessionId),
+});
 
 // ── durable chat ──────────────────────────────────────────────────────
 const chat = agentic.session("chat:user-123", {
@@ -65,12 +73,6 @@ const chat = agentic.session("chat:user-123", {
   compaction: { limit: 0.3 },          // compact at 30% of context window
 });
 const reply = await chat.send("hey!", { onPart: (p) => {/* stream to UI */} });
-
-// after a crash/deploy, on boot:
-for (const id of await agentic.interruptedSessions()) {
-  // re-supply the agent config and pick up where the run left off
-  await agentic.session(id, myAgentFor(id)).resume();
-}
 
 // ── workflow task with a guaranteed outcome ───────────────────────────
 const outcome = await agentic.task({
@@ -93,7 +95,8 @@ or one hook:
 ```ts
 createAgentic({ logs: true })            // colored console line per event
 createAgentic({ onEvent: (e) => log(e) })  // or ship them anywhere
-// run-start · step · retry · compaction · poke · queued-message · run-end
+// run-start · step · retry · compaction · poke · queued-message ·
+// auto-resume · run-end
 ```
 
 ## À-la-carte helpers
@@ -122,7 +125,7 @@ Everything the harness is built from is exported for use with plain
 npx tsx playground/boilerplate.ts          # the smallest useful setup — copy me
 npx tsx playground/mvp/demo-task.ts        # schema self-heal + guaranteed outcome
 npx tsx playground/mvp/demo-chaos.ts       # injected 500s + severed SSE mid-run
-npx tsx playground/mvp/demo-restart.ts     # SIGKILL mid-run → resume in new process
+npx tsx playground/mvp/demo-restart.ts     # SIGKILL mid-run → autoResume in new process
 npx tsx playground/mvp/demo-compaction.ts  # memory survives two compactions
 npx tsx playground/mvp/demo-queue.ts       # send() mid-run queues into the live run
 npx tsx playground/mvp/before-after/before.ts  # the plumbing you'd write by hand

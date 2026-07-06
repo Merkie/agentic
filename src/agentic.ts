@@ -13,6 +13,7 @@ import { fileStorage } from "./storage.js";
 import type {
 	AgentConfig,
 	EventListener,
+	MaybePromise,
 	RunResult,
 	StorageProvider,
 	StoredEvent,
@@ -20,11 +21,43 @@ import type {
 	UsageTotals,
 } from "./types.js";
 
+/**
+ * Maps a session id to the agent config that should resume it, or null/
+ * undefined to leave that session alone. Configs hold live tool functions,
+ * so they can't be persisted — this is how the app re-supplies them.
+ */
+export type AutoResumeResolver = (
+	sessionId: string,
+) => MaybePromise<AgentConfig<ToolSet> | null | undefined>;
+
+export interface AutoResumeOptions {
+	/** Re-supply the agent config for a session found interrupted. */
+	agentFor: AutoResumeResolver;
+	/**
+	 * Crash-loop breaker: after this many automatic resume attempts on the
+	 * same interrupted work (counted in the ledger, so it survives restarts),
+	 * the sweep stops retrying and emits an auto-resume give-up event.
+	 * Manual resume() calls are never capped. Default 3.
+	 */
+	maxAttempts?: number;
+	/** Pause between resume kicks so a big boot doesn't stampede the provider. Default 0. */
+	staggerMs?: number;
+}
+
 export interface AgenticOptions {
 	/** Defaults to OPENROUTER_API_KEY from the environment. */
 	apiKey?: string;
 	/** Where sessions live. Defaults to JSONL files under ./.agentic */
 	storage?: StorageProvider;
+	/**
+	 * Make crash recovery automatic: as soon as the harness is created it
+	 * sweeps storage for interrupted work (open runs, unanswered queued
+	 * messages) and resumes each session in the background, using this
+	 * resolver to map session ids back to agent configs. Pass the resolver
+	 * directly or wrap it in {@link AutoResumeOptions} to tune the attempt
+	 * cap / stagger. resumeInterrupted() runs the same sweep on demand.
+	 */
+	autoResume?: AutoResumeResolver | AutoResumeOptions;
 	/** Observability firehose: run/step/retry/compaction/poke events. */
 	onEvent?: EventListener;
 	/**
@@ -38,6 +71,12 @@ export interface AgenticOptions {
 	extraBody?: Record<string, unknown>;
 	/** Header/SSE-idle stall detection. Defaults 60s/120s; false disables. */
 	fetchTimeouts?: ResilientFetchOptions | false;
+	/**
+	 * Advanced: override model construction (custom providers, tests). When
+	 * set, the OpenRouter factory is bypassed for model resolution.
+	 */
+	// biome-ignore lint/suspicious/noExplicitAny: contravariant position — any AgentConfig works
+	getModel?: (modelId: string, agent: AgentConfig<any>) => LanguageModel;
 }
 
 export interface SendOptions<TOOLS extends ToolSet = ToolSet> {
@@ -111,9 +150,19 @@ export interface Agentic {
 	sessions(): Promise<string[]>;
 	/**
 	 * Sessions with recoverable work — an interrupted run or queued user
-	 * messages that never got a response. Feed these to resume() on boot.
+	 * messages that never got a response. Runs live in this process don't
+	 * count. With autoResume configured these are swept up automatically;
+	 * otherwise feed them to resume() on boot.
 	 */
 	interruptedSessions(): Promise<string[]>;
+	/**
+	 * Run the auto-resume sweep now (it already runs once, in the background,
+	 * when the harness is created): resume every interrupted session whose
+	 * config the autoResume resolver supplies, skipping any that exhausted
+	 * the attempt cap. Resolves with the finished runs' results. Throws if
+	 * autoResume was not configured.
+	 */
+	resumeInterrupted(): Promise<RunResult[]>;
 	/** The underlying storage, for app-level queries. */
 	storage: StorageProvider;
 }
@@ -140,7 +189,9 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 
 	// biome-ignore lint/suspicious/noExplicitAny: only extraBody is read
 	const getModel = (modelId: string, agent: AgentConfig<any>): LanguageModel =>
-		openrouter.chat(modelId, agent.extraBody ? { extraBody: agent.extraBody } : {});
+		options.getModel
+			? options.getModel(modelId, agent)
+			: openrouter.chat(modelId, agent.extraBody ? { extraBody: agent.extraBody } : {});
 
 	// One run at a time per session: concurrent send()s queue up rather than
 	// interleave steps into the same ledger.
@@ -265,6 +316,11 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				return withSessionLock(id, async () => {
 					const replayed = replaySession(await storage.load(id));
 					if (!replayed.interruptedRunId && replayed.pendingMessages === 0) return null;
+					await storage.append(id, {
+						type: "run-resume",
+						at: new Date().toISOString(),
+						runId: replayed.interruptedRunId,
+					});
 					return execRun<TOOLS>(id, agent, {
 						abortSignal: resumeOptions.abortSignal,
 						onPart: resumeOptions.onPart,
@@ -283,6 +339,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				};
 			},
 			async isInterrupted() {
+				if (liveRuns.has(id)) return false; // live in this process = running, not interrupted
 				const replayed = replaySession(await storage.load(id));
 				return replayed.interruptedRunId !== null || replayed.pendingMessages > 0;
 			},
@@ -430,21 +487,108 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		});
 	}
 
+	async function interruptedSessions(): Promise<string[]> {
+		const ids = (await storage.listSessions?.()) ?? [];
+		const interrupted: string[] = [];
+		for (const id of ids) {
+			// A run that is live in THIS process isn't interrupted — it's running.
+			if (liveRuns.has(id)) continue;
+			const replayed = replaySession(await storage.load(id));
+			if (replayed.interruptedRunId || replayed.pendingMessages > 0) interrupted.push(id);
+		}
+		return interrupted;
+	}
+
+	const autoResume: AutoResumeOptions | undefined =
+		typeof options.autoResume === "function"
+			? { agentFor: options.autoResume }
+			: options.autoResume;
+
+	// The boot sweep (halo-style): find interrupted work, re-supply configs
+	// through the resolver, and re-drive each session. Kicks are concurrent
+	// (optionally staggered); the returned promise settles when every resumed
+	// run finishes. The per-session attempt cap lives in the LEDGER, so a run
+	// that crashes the process on every resume stops being retried after
+	// maxAttempts restarts instead of wedging the server into a boot loop.
+	async function resumeInterrupted(): Promise<RunResult[]> {
+		if (!autoResume) {
+			throw new Error("resumeInterrupted() needs createAgentic({ autoResume: ... }) configured");
+		}
+		const maxAttempts = autoResume.maxAttempts ?? 3;
+		const staggerMs = autoResume.staggerMs ?? 0;
+		const kicks: Promise<RunResult | null>[] = [];
+		for (const id of await interruptedSessions()) {
+			const replayed = replaySession(await storage.load(id));
+			const attempt = replayed.autoResumeAttempts + 1;
+			if (attempt > maxAttempts) {
+				emitEvent({
+					type: "auto-resume",
+					sessionId: id,
+					runId: replayed.interruptedRunId,
+					attempt,
+					maxAttempts,
+					action: "give-up",
+				});
+				continue;
+			}
+			let agent: AgentConfig<ToolSet> | null | undefined;
+			try {
+				agent = await autoResume.agentFor(id);
+			} catch {
+				agent = null; // a broken resolver skips the session, never kills the sweep
+			}
+			if (!agent) continue;
+			emitEvent({
+				type: "auto-resume",
+				sessionId: id,
+				runId: replayed.interruptedRunId,
+				attempt,
+				maxAttempts,
+				action: "resume",
+			});
+			const resolvedAgent = agent;
+			kicks.push(
+				withSessionLock(id, async () => {
+					// Re-check under the lock — a send() may have raced the sweep.
+					if (liveRuns.has(id)) return null;
+					const current = replaySession(await storage.load(id));
+					if (!current.interruptedRunId && current.pendingMessages === 0) return null;
+					await storage.append(id, {
+						type: "run-resume",
+						at: new Date().toISOString(),
+						runId: current.interruptedRunId,
+						auto: true,
+					});
+					return execRun<ToolSet>(id, resolvedAgent, {
+						resumeRunId: current.interruptedRunId ?? undefined,
+					});
+				}),
+			);
+			if (staggerMs > 0) await wait(staggerMs);
+		}
+		return (await Promise.all(kicks)).filter((r): r is RunResult => r !== null);
+	}
+
+	// Crash recovery that "just works": sweep in the background the moment
+	// the harness comes up. Deferred a microtask so the caller finishes wiring
+	// (event listeners etc.) before any run starts.
+	if (autoResume) {
+		queueMicrotask(() => {
+			resumeInterrupted().catch(() => {
+				// storage failures at boot must not take the process down;
+				// the next resumeInterrupted() call (or restart) retries
+			});
+		});
+	}
+
 	return {
 		session,
 		task,
 		async sessions() {
 			return (await storage.listSessions?.()) ?? [];
 		},
-		async interruptedSessions() {
-			const ids = (await storage.listSessions?.()) ?? [];
-			const interrupted: string[] = [];
-			for (const id of ids) {
-				const replayed = replaySession(await storage.load(id));
-				if (replayed.interruptedRunId || replayed.pendingMessages > 0) interrupted.push(id);
-			}
-			return interrupted;
-		},
+		interruptedSessions,
+		resumeInterrupted,
 		storage,
 	};
 }

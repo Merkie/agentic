@@ -63,6 +63,13 @@ export const logEvents: EventListener = (event: AgenticEvent): void => {
 				),
 			);
 			break;
+		case "auto-resume": {
+			const line = `⟲ auto-resume ${
+				event.action === "resume" ? "resuming" : "giving up on"
+			} session=${event.sessionId} · attempt ${event.attempt}/${event.maxAttempts}`;
+			console.log(event.action === "resume" ? chalk.blue(line) : chalk.red(line));
+			break;
+		}
 		case "queued-message":
 			console.log(
 				chalk.blue(

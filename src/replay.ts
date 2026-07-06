@@ -20,6 +20,13 @@ export interface ReplayedSession {
 	 * failure on every boot).
 	 */
 	pendingMessages: number;
+	/**
+	 * Auto-resume sweep attempts on the currently-open work (run-resume
+	 * events with auto=true since the last run-end). A run-end resets the
+	 * count. The sweep uses this as its crash-loop breaker: a run that keeps
+	 * killing the process on resume stops being retried after the cap.
+	 */
+	autoResumeAttempts: number;
 	/** How many malformed parts the sanitizer had to repair on load. */
 	repaired: number;
 }
@@ -34,6 +41,7 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 	let messages: ModelMessage[] = [];
 	let totals = emptyTotals();
 	let pendingMessages = 0;
+	let autoResumeAttempts = 0;
 	const openRuns = new Map<string, true>();
 
 	for (const event of events) {
@@ -58,9 +66,13 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 			case "run-start":
 				openRuns.set(event.runId, true);
 				break;
+			case "run-resume":
+				if (event.auto) autoResumeAttempts += 1;
+				break;
 			case "run-end":
 				openRuns.delete(event.runId);
 				pendingMessages = 0;
+				autoResumeAttempts = 0;
 				break;
 		}
 	}
@@ -74,6 +86,7 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 		totals,
 		interruptedRunId: lastOpen,
 		pendingMessages,
+		autoResumeAttempts,
 		repaired: sanitized.removed,
 	};
 }

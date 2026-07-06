@@ -75,6 +75,15 @@ export type StoredEvent =
 			usage?: StepUsage;
 	  }
 	| {
+			/** A resume re-entered interrupted work (open run or queued messages). */
+			type: "run-resume";
+			at: string;
+			/** The interrupted run being re-entered; null when resuming queued messages only. */
+			runId: string | null;
+			/** True when the boot-time auto-resume sweep kicked it (counts toward the attempt cap). */
+			auto?: boolean;
+	  }
+	| {
 			type: "run-end";
 			at: string;
 			runId: string;
@@ -185,6 +194,15 @@ export type AgenticEvent =
 	| { type: "poke"; sessionId: string; runId: string; poke: number; maxPokes: number }
 	/** A send() landed while a run was live and was queued into it. */
 	| { type: "queued-message"; sessionId: string; runId: string | null }
+	/** The auto-resume sweep found interrupted work: resuming it, or giving up after too many attempts. */
+	| {
+			type: "auto-resume";
+			sessionId: string;
+			runId: string | null;
+			attempt: number;
+			maxAttempts: number;
+			action: "resume" | "give-up";
+	  }
 	| {
 			type: "run-end";
 			sessionId: string;

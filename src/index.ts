@@ -4,6 +4,8 @@
 export {
 	type Agentic,
 	type AgenticOptions,
+	type AutoResumeOptions,
+	type AutoResumeResolver,
 	createAgentic,
 	type SendOptions,
 	type Session,

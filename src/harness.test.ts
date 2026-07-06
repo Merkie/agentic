@@ -3,6 +3,7 @@ import { type ModelMessage, tool } from "ai";
 import { convertArrayToReadableStream, MockLanguageModelV3 } from "ai/test";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { createAgentic } from "./agentic.js";
 import { retryDelayMs } from "./backoff.js";
 import { classifyFailure } from "./failure.js";
 import { setContextWindow } from "./modelMeta.js";
@@ -169,6 +170,21 @@ describe("replaySession", () => {
 				{ type: "run-start", at: "t", runId: "r1", model: "m" },
 				{ type: "run-end", at: "t", runId: "r1", status: "cancelled" },
 			]).pendingMessages,
+		).toBe(0);
+	});
+
+	it("counts auto resume attempts, ignoring manual ones, reset by run-end", () => {
+		const open: StoredEvent[] = [
+			{ type: "run-start", at: "t", runId: "r1", model: "m" },
+			{ type: "run-resume", at: "t", runId: "r1", auto: true },
+			// manual resume() — uncapped, must not count toward the breaker
+			{ type: "run-resume", at: "t", runId: "r1" },
+			{ type: "run-resume", at: "t", runId: "r1", auto: true },
+		];
+		expect(replaySession(open).autoResumeAttempts).toBe(2);
+		expect(
+			replaySession([...open, { type: "run-end", at: "t", runId: "r1", status: "completed" }])
+				.autoResumeAttempts,
 		).toBe(0);
 	});
 });
@@ -475,5 +491,142 @@ describe("hoistSandwichedUsers", () => {
 		hoistSandwichedUsers(messages, 1);
 		expect(roles(messages)).toEqual(["assistant", "tool"]);
 		hoistSandwichedUsers([], 1);
+	});
+});
+
+describe("auto-resume", () => {
+	const textStream = (text: string) =>
+		convertArrayToReadableStream<LanguageModelV3StreamPart>([
+			{ type: "stream-start", warnings: [] },
+			{ type: "text-start", id: "1" },
+			{ type: "text-delta", id: "1", delta: text },
+			{ type: "text-end", id: "1" },
+			{
+				type: "finish",
+				finishReason: { unified: "stop", raw: "stop" },
+				usage: {
+					inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+					outputTokens: { total: 5, text: 5, reasoning: undefined },
+				},
+			},
+		]);
+
+	it("boot sweep finds a crashed run and drives it to completion", async () => {
+		setContextWindow("mock/model", 100_000);
+		const storage = memoryStorage();
+		await storage.append("crashed", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "count to three" },
+		});
+		await storage.append("crashed", {
+			type: "run-start",
+			at: "t1",
+			runId: "r1",
+			model: "mock/model",
+		});
+		await storage.append("crashed", {
+			type: "step",
+			at: "t2",
+			runId: "r1",
+			messages: [{ role: "assistant", content: "one…" }],
+			finishReason: "stop",
+			usage: usage(),
+		});
+		// the process died here — no run-end
+
+		const model = new MockLanguageModelV3({
+			doStream: async () => ({ stream: textStream("two, three — done") }),
+		});
+		const eventTypes: string[] = [];
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			autoResume: () => ({ model: "mock/model" }),
+			onEvent: (e) => eventTypes.push(e.type),
+		});
+
+		// The background boot sweep and this call race benignly: kicks re-check
+		// under the session lock, so exactly one of them re-drives the run.
+		await agentic.resumeInterrupted();
+
+		const ledger = await storage.load("crashed");
+		expect(ledger.filter((e) => e.type === "run-resume")).toEqual([
+			expect.objectContaining({ type: "run-resume", runId: "r1", auto: true }),
+		]);
+		// resumed under the ORIGINAL runId — no second run-start
+		expect(ledger.filter((e) => e.type === "run-start")).toHaveLength(1);
+		expect(ledger.filter((e) => e.type === "run-end")).toEqual([
+			expect.objectContaining({ status: "completed" }),
+		]);
+		expect(eventTypes).toContain("auto-resume");
+		expect(await agentic.interruptedSessions()).toEqual([]);
+	});
+
+	it("manual sweep resumes an orphaned queued message and returns the result", async () => {
+		setContextWindow("mock/model", 100_000);
+		const storage = memoryStorage();
+		const model = new MockLanguageModelV3({ doStream: async () => ({ stream: textStream("42") }) });
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			autoResume: (sessionId) => (sessionId === "orphan" ? { model: "mock/model" } : null),
+		});
+		// let the (empty) boot sweep drain before creating the orphan
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		await storage.append("orphan", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "what is 6*7?" },
+			meta: { queued: true, queueId: "q-1" },
+		});
+
+		const results = await agentic.resumeInterrupted();
+		expect(results).toHaveLength(1);
+		expect(results[0].status).toBe("completed");
+		expect(results[0].text).toBe("42");
+		expect(replaySession(await storage.load("orphan")).pendingMessages).toBe(0);
+	});
+
+	it("gives up after the ledger-counted attempt cap instead of crash-looping", async () => {
+		setContextWindow("mock/model", 100_000);
+		const storage = memoryStorage();
+		await storage.append("wedged", {
+			type: "run-start",
+			at: "t0",
+			runId: "r1",
+			model: "mock/model",
+		});
+		for (let i = 0; i < 3; i++) {
+			await storage.append("wedged", { type: "run-resume", at: "t", runId: "r1", auto: true });
+		}
+
+		let modelCalls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				modelCalls += 1;
+				return { stream: textStream("never") };
+			},
+		});
+		const giveUps: string[] = [];
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			autoResume: () => ({ model: "mock/model" }),
+			onEvent: (e) => {
+				if (e.type === "auto-resume" && e.action === "give-up") giveUps.push(e.sessionId);
+			},
+		});
+
+		const results = await agentic.resumeInterrupted();
+		expect(results).toEqual([]);
+		expect(giveUps).toContain("wedged");
+		expect(modelCalls).toBe(0);
+		// the ledger is untouched — a manual resume() can still retry by hand
+		expect((await storage.load("wedged")).filter((e) => e.type === "run-resume")).toHaveLength(3);
 	});
 });

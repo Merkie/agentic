@@ -1,19 +1,16 @@
 // Server-restart survival demo. Phase "start": kick off a long multi-tool run
 // with file storage and hard-kill the process mid-run (SIGKILL — no cleanup).
-// Phase "resume": new process finds the interrupted session in storage and
-// resumes the SAME run to completion from the last persisted step.
+// Phase "resume": new process boots with autoResume — the harness itself
+// finds the interrupted session in storage and resumes the SAME run to
+// completion from the last persisted step. No recovery code in the app.
 import "dotenv/config";
 import { spawn } from "node:child_process";
 import { tool } from "ai";
 import { z } from "zod";
-import { createAgentic, fileStorage } from "../../src/index.js";
+import { type AgenticEvent, createAgentic, fileStorage } from "../../src/index.js";
 
 const DIR = "./playground/mvp/.restart-demo";
 const phase = process.argv[2] ?? "orchestrate";
-
-function buildAgentic() {
-	return createAgentic({ storage: fileStorage(DIR), logs: true });
-}
 
 const agentConfig = {
 	model: "xiaomi/mimo-v2.5",
@@ -34,27 +31,32 @@ const PROMPT =
 	"Look up these cities one at a time with lookup_city: Tokyo, Paris, Berlin, Madrid, Rome. Then summarize which is largest.";
 
 if (phase === "start") {
-	const session = buildAgentic().session("restart-demo", agentConfig);
-	const result = await session.send(PROMPT);
+	const agentic = createAgentic({ storage: fileStorage(DIR), logs: true });
+	const result = await agentic.session("restart-demo", agentConfig).send(PROMPT);
 	console.log("completed without being killed:", result.status);
 } else if (phase === "resume") {
-	const agentic = buildAgentic();
-	const interrupted = await agentic.interruptedSessions();
-	console.log("interrupted sessions found:", interrupted);
-	const session = agentic.session("restart-demo", agentConfig);
-	console.log("isInterrupted:", await session.isInterrupted());
-	const result = await session.resume();
-	if (!result) {
-		console.log("nothing to resume?!");
-		process.exit(1);
-	}
-	console.log(`\nRESUMED RESULT: ${result.status}`);
-	console.log(`TEXT: ${result.text.slice(0, 300)}`);
-	const stats = await session.stats();
+	// The ONLY recovery wiring an app needs: autoResume maps session ids back
+	// to their agent configs (tools are functions — storage can't hold them).
+	// The harness sweeps storage on boot and re-drives the run by itself.
+	let settle: (event: Extract<AgenticEvent, { type: "run-end" }>) => void;
+	const finished = new Promise<Extract<AgenticEvent, { type: "run-end" }>>((resolve) => {
+		settle = resolve;
+	});
+	const agentic = createAgentic({
+		storage: fileStorage(DIR),
+		logs: true,
+		autoResume: () => agentConfig,
+		onEvent: (e) => {
+			if (e.type === "run-end") settle(e);
+		},
+	});
+	const ended = await finished; // no resume() call anywhere — boot sweep did it
+	console.log(`\nAUTO-RESUMED RESULT: ${ended.status}`);
+	const stats = await agentic.session("restart-demo", agentConfig).stats();
 	console.log(
 		`lifetime: ${stats.steps} steps, $${stats.cost.toFixed(6)}, context ${stats.contextTokens} tokens`,
 	);
-	process.exit(result.status === "completed" ? 0 : 1);
+	process.exit(ended.status === "completed" ? 0 : 1);
 } else {
 	// orchestrate: start child, SIGKILL it mid-run, then resume in a new process
 	const { rmSync } = await import("node:fs");
