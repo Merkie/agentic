@@ -33,7 +33,7 @@ export {
 	type ResilientFetchOptions,
 	StreamIdleTimeoutError,
 } from "./resilientFetch.js";
-export { type RunLoopOptions, runLoop } from "./run.js";
+export { createMailbox, type RunLoopOptions, type RunMailbox, runLoop } from "./run.js";
 export { sanitizeConversation } from "./sanitize.js";
 export { fileStorage, memoryStorage } from "./storage.js";
 export { guardToolResultSizes, type ToolGuardOptions } from "./toolGuard.js";

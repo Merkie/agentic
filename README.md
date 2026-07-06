@@ -26,6 +26,11 @@ plumbing once, battle-tested, so your code is just models, prompts, and tools.
   it can fix — no memoryless structured-output retries), and pokes the model
   if it ends its turn without calling a terminal tool. You always get
   `submitted | cancelled | failed`, never a throw.
+- **Messages sent mid-run queue into the run — durably.** A `send()` while
+  the agent is working is appended to the ledger *first* (a crash can never
+  drop it), then folded into the live run at its next step boundary; the run
+  doesn't end while unanswered input is waiting. Queued messages orphaned by
+  a restart are picked up by `resume()` like any interrupted work.
 - **Chats outlive the context window.** Compaction triggers on real
   provider-reported token counts against the model's actual context window
   (fetched from OpenRouter), summarizes into a hand-off message, and keeps
@@ -86,7 +91,7 @@ of it is resumable, auditable, and cost-tracked. Observability is one hook:
 
 ```ts
 createAgentic({ onEvent: (e) => log(e) })
-// run-start · step · retry · compaction · poke · run-end
+// run-start · step · retry · compaction · poke · queued-message · run-end
 ```
 
 ## À-la-carte helpers
@@ -116,6 +121,7 @@ npx tsx playground/mvp/demo-task.ts        # schema self-heal + guaranteed outco
 npx tsx playground/mvp/demo-chaos.ts       # injected 500s + severed SSE mid-run
 npx tsx playground/mvp/demo-restart.ts     # SIGKILL mid-run → resume in new process
 npx tsx playground/mvp/demo-compaction.ts  # memory survives two compactions
+npx tsx playground/mvp/demo-queue.ts       # send() mid-run queues into the live run
 npx tsx playground/mvp/before-after/before.ts  # the plumbing you'd write by hand
 npx tsx playground/mvp/before-after/after.ts   # the same workflow on the harness
 ```

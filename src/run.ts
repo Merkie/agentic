@@ -35,6 +35,77 @@ import { addStepToTotals, contextTokensOf, emptyTotals, extractStepUsage } from 
 // (onStepFinish), so a 30-minute run that dies at minute 29 loses at most the
 // step in flight.
 
+// ── message queueing ─────────────────────────────────────────────────────
+// A mailbox is the in-process half of message queueing (the design is
+// opencode's: THE QUEUE IS STORAGE). send() on a busy session appends the
+// user message to the ledger first — durable immediately, so a crash can
+// never drop it — then signals the live run through its mailbox so the loop
+// picks the message up at the next step boundary instead of ending. The
+// ledger alone also recovers the cross-process/crash cases: replay counts
+// trailing unanswered user messages (`pendingMessages`) so resume() knows
+// there is queued work even when the mailbox died with its process.
+
+export interface RunMailbox {
+	/** The live run's id, set when the loop starts. */
+	runId: string | null;
+	/**
+	 * False once the run has committed to ending. tryEnqueue() then refuses,
+	 * telling the caller to start a fresh run for its (already-persisted)
+	 * message instead.
+	 */
+	accepting: boolean;
+	/** queueIds of ledger-appended messages the loop has not yet consumed. */
+	queued: string[];
+	/** Live-stream listeners contributed by attached send() calls. */
+	partListeners: Array<(part: unknown) => void>;
+	/** Signal a new ledger message. Returns false if the run stopped listening. */
+	tryEnqueue(queueId: string): boolean;
+}
+
+export function createMailbox(): RunMailbox {
+	const mailbox: RunMailbox = {
+		runId: null,
+		accepting: true,
+		queued: [],
+		partListeners: [],
+		tryEnqueue(queueId: string) {
+			if (!mailbox.accepting) return false;
+			mailbox.queued.push(queueId);
+			return true;
+		},
+	};
+	return mailbox;
+}
+
+function ledgerHasQueued(events: StoredEvent[], queueId: string): boolean {
+	for (let i = events.length - 1; i >= 0; i--) {
+		const event = events[i];
+		if (event.type === "user-message" && event.meta?.queueId === queueId) return true;
+	}
+	return false;
+}
+
+// A queued message that arrived while a step was streaming sits in the
+// ledger BEFORE that step's event, so the replayed conversation shows it
+// sandwiched under model output that never saw it. For the next request,
+// move that trailing user block after the model's output so the model reads
+// it as the newest input. Per-request only — the ledger keeps arrival order.
+// Exported for tests: a splice off-by-one here would wedge a user message
+// between a tool call and its result, which providers reject outright.
+export function hoistSandwichedUsers(messages: ModelMessage[], max: number): void {
+	if (messages.length === 0 || max <= 0) return;
+	let i = messages.length - 1;
+	if (messages[i].role === "user") return; // already trailing input
+	while (i >= 0 && (messages[i].role === "assistant" || messages[i].role === "tool")) i -= 1;
+	let start = i;
+	while (start >= 0 && messages[start].role === "user") start -= 1;
+	start += 1;
+	const count = Math.min(i - start + 1, max);
+	if (count <= 0) return;
+	const block = messages.splice(i - count + 1, count);
+	messages.push(...block);
+}
+
 export interface RunLoopOptions<TOOLS extends ToolSet = ToolSet> {
 	sessionId: string;
 	agent: AgentConfig<TOOLS>;
@@ -56,6 +127,11 @@ export interface RunLoopOptions<TOOLS extends ToolSet = ToolSet> {
 	maxPokes?: number;
 	/** Resume an interrupted run under its original runId. */
 	resumeRunId?: string;
+	/**
+	 * Live message queueing: signals ledger-appended user messages so the loop
+	 * picks them up at the next step boundary instead of ending the run.
+	 */
+	mailbox?: RunMailbox;
 }
 
 function newId(): string {
@@ -118,6 +194,8 @@ export async function runLoop<TOOLS extends ToolSet>(
 	const append = (event: StoredEvent) => storage.append(sessionId, event);
 
 	const runId = options.resumeRunId ?? newId();
+	const mailbox = options.mailbox;
+	if (mailbox) mailbox.runId = runId;
 	let runStarted = options.resumeRunId !== undefined;
 	let totals: UsageTotals = emptyTotals();
 	let finalText = "";
@@ -130,6 +208,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 	const startedAt = Date.now();
 
 	const fail = async (error: unknown): Promise<RunResult> => {
+		if (mailbox) mailbox.accepting = false;
 		const serialized = serializeError(error);
 		await append({ type: "run-end", at: now(), runId, status: "failed", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "failed", totals, error: serialized });
@@ -137,6 +216,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 	};
 
 	const cancel = async (reason: unknown): Promise<RunResult> => {
+		if (mailbox) mailbox.accepting = false;
 		const serialized = serializeError(reason ?? "Cancelled");
 		await append({ type: "run-end", at: now(), runId, status: "cancelled", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "cancelled", totals, error: serialized });
@@ -181,7 +261,17 @@ export async function runLoop<TOOLS extends ToolSet>(
 	while (true) {
 		if (options.abortSignal?.aborted) return cancel(options.abortSignal.reason);
 
-		const replayed = replaySession(await storage.load(sessionId));
+		const events = await storage.load(sessionId);
+		const replayed = replaySession(events);
+		// Queued live pickup: consume the mailbox arrivals this snapshot has.
+		// Anything the load raced past stays queued and triggers another pass.
+		if (mailbox && mailbox.queued.length > 0) {
+			const inSnapshot = mailbox.queued.filter((id) => ledgerHasQueued(events, id));
+			if (inSnapshot.length > 0) {
+				hoistSandwichedUsers(replayed.messages, inSnapshot.length);
+				mailbox.queued = mailbox.queued.filter((id) => !inSnapshot.includes(id));
+			}
+		}
 		const contextWindow = await getContextWindow(agent.model);
 		totals = { ...totals, contextWindow };
 
@@ -259,6 +349,9 @@ export async function runLoop<TOOLS extends ToolSet>(
 			stopWhen: [
 				stepCountIs(agent.maxSteps ?? 50),
 				() => compactPending || options.isSettled?.() === true,
+				// a queued message arrived mid-pass: stop at this step boundary so
+				// the next pass folds it into the conversation
+				() => (mailbox?.queued.length ?? 0) > 0,
 				...(agent.stopWhen ?? []),
 			],
 			onStepFinish: (step) => {
@@ -315,6 +408,13 @@ export async function runLoop<TOOLS extends ToolSet>(
 				} catch {
 					// a broken part listener must never kill a run
 				}
+				for (const listener of mailbox?.partListeners ?? []) {
+					try {
+						listener(part);
+					} catch {
+						// same rule for attached listeners
+					}
+				}
 			}
 		} catch (err) {
 			if (streamError === undefined) streamError = err;
@@ -366,6 +466,11 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// model picks its task back up.
 		if (compactPending && lastFinishReason === "tool-calls") continue;
 
+		// Unconsumed queued messages: the run does not end while there is
+		// unanswered user input (opencode's exit rule) — unless the task has
+		// already settled, in which case the outcome stands.
+		if ((mailbox?.queued.length ?? 0) > 0 && options.isSettled?.() !== true) continue;
+
 		if (options.isSettled && !options.isSettled()) {
 			pokes += 1;
 			if (pokes > maxPokes) {
@@ -386,6 +491,10 @@ export async function runLoop<TOOLS extends ToolSet>(
 			continue;
 		}
 
+		// Point of no return: refuse new mailbox enqueues synchronously BEFORE
+		// the run-end append, so a send() racing this exit falls back to
+		// starting its own run instead of attaching to one that won't look.
+		if (mailbox) mailbox.accepting = false;
 		await append({ type: "run-end", at: now(), runId, status: "completed" });
 		emit({ type: "run-end", sessionId, runId, status: "completed", totals });
 		// The model finished its turn over the threshold — compact silently

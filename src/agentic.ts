@@ -7,13 +7,14 @@ import { getContextWindow } from "./modelMeta.js";
 import { createOpenRouter } from "./openrouter.js";
 import { replaySession } from "./replay.js";
 import { createResilientFetch, type ResilientFetchOptions } from "./resilientFetch.js";
-import { runLoop } from "./run.js";
+import { createMailbox, type RunLoopOptions, runLoop } from "./run.js";
 import { fileStorage } from "./storage.js";
 import type {
 	AgentConfig,
 	EventListener,
 	RunResult,
 	StorageProvider,
+	StoredEvent,
 	TaskOutcome,
 	UsageTotals,
 } from "./types.js";
@@ -38,15 +39,27 @@ export interface SendOptions<TOOLS extends ToolSet = ToolSet> {
 	abortSignal?: AbortSignal;
 	/** App-supplied tag stored on the user-message event (dedup keys etc.). */
 	meta?: Record<string, unknown>;
+	/**
+	 * When the session has a live run, queue this message into it: the message
+	 * is appended to the ledger first (durable — a crash cannot drop it), the
+	 * run folds it in at its next step boundary, and this send resolves with
+	 * that run's result. Set false to wait for the live run to finish and get
+	 * a dedicated run instead. Default true.
+	 */
+	queue?: boolean;
 }
 
 export interface Session<TOOLS extends ToolSet = ToolSet> {
 	id: string;
-	/** Append a user message and run the agent to completion. */
+	/**
+	 * Append a user message and run the agent to completion. If a run is
+	 * already live, the message is queued into it (see SendOptions.queue).
+	 */
 	send(content: string | ModelMessage, options?: SendOptions<TOOLS>): Promise<RunResult>;
 	/**
-	 * Re-enter a run that a crash/restart left open (run-start with no
-	 * run-end). Resolves null when there is nothing to resume.
+	 * Re-enter work a crash/restart left behind: an open run (run-start with
+	 * no run-end) or queued user messages that never got a response. Resolves
+	 * null when there is nothing to resume.
 	 */
 	resume(options?: Pick<SendOptions<TOOLS>, "onPart" | "abortSignal">): Promise<RunResult | null>;
 	/** The replay-ready conversation as the model would see it. */
@@ -90,7 +103,10 @@ export interface Agentic {
 	): Promise<TaskOutcome<T>>;
 	/** Session ids known to storage (when the provider supports listing). */
 	sessions(): Promise<string[]>;
-	/** Sessions with an interrupted run — feed these to resume() on boot. */
+	/**
+	 * Sessions with recoverable work — an interrupted run or queued user
+	 * messages that never got a response. Feed these to resume() on boot.
+	 */
 	interruptedSessions(): Promise<string[]>;
 	/** The underlying storage, for app-level queries. */
 	storage: StorageProvider;
@@ -133,23 +149,106 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		return next;
 	}
 
+	// The session's live run, if any — what send() queues messages into.
+	interface LiveRun {
+		mailbox: ReturnType<typeof createMailbox>;
+		result: Promise<RunResult>;
+	}
+	const liveRuns = new Map<string, LiveRun>();
+
+	// Start a run registered in the live-run map so concurrent send()s can
+	// queue into it. Must be called while holding the session lock.
+	function execRun<TOOLS extends ToolSet>(
+		sessionId: string,
+		agent: AgentConfig<TOOLS>,
+		runOptions: Partial<
+			Pick<
+				RunLoopOptions<TOOLS>,
+				"abortSignal" | "onPart" | "resumeRunId" | "isSettled" | "pokeMessage" | "maxPokes"
+			>
+		>,
+	): Promise<RunResult> {
+		const mailbox = createMailbox();
+		const result = runLoop<TOOLS>({
+			sessionId,
+			agent,
+			storage,
+			getModel,
+			emit: options.onEvent,
+			mailbox,
+			...runOptions,
+		});
+		liveRuns.set(sessionId, { mailbox, result });
+		const cleanup = () => {
+			if (liveRuns.get(sessionId)?.mailbox === mailbox) liveRuns.delete(sessionId);
+		};
+		result.then(cleanup, cleanup);
+		return result;
+	}
+
+	const emitEvent: EventListener = (event) => {
+		try {
+			options.onEvent?.(event);
+		} catch {
+			// a broken listener must never break a send
+		}
+	};
+
 	function session<TOOLS extends ToolSet>(id: string, agent: AgentConfig<TOOLS>): Session<TOOLS> {
 		return {
 			id,
 			send(content, sendOptions = {}) {
+				const message = toUserMessage(content);
+				const live = sendOptions.queue !== false ? liveRuns.get(id) : undefined;
+				if (live?.mailbox.accepting) {
+					return (async () => {
+						// Persist FIRST — the message survives even if everything
+						// after this line dies. Then signal the live run.
+						const queueId = newId();
+						await storage.append(id, {
+							type: "user-message",
+							at: new Date().toISOString(),
+							message,
+							meta: { ...sendOptions.meta, queued: true, queueId },
+						});
+						if (live.mailbox.tryEnqueue(queueId)) {
+							if (sendOptions.onPart) {
+								live.mailbox.partListeners.push(sendOptions.onPart as (part: unknown) => void);
+							}
+							emitEvent({ type: "queued-message", sessionId: id, runId: live.mailbox.runId });
+							return live.result;
+						}
+						// The run committed to ending while the append settled. The
+						// message is safely in the ledger — give it its own run,
+						// unless the ending run's final pass already replayed it.
+						return withSessionLock(id, async () => {
+							const events = await storage.load(id);
+							if (queuedMessageAnswered(events, queueId)) {
+								const replayed = replaySession(events);
+								return {
+									status: "completed" as const,
+									text: lastAssistantText(replayed.messages),
+									totals: {
+										...replayed.totals,
+										contextWindow: await getContextWindow(agent.model),
+									},
+								};
+							}
+							return execRun<TOOLS>(id, agent, {
+								abortSignal: sendOptions.abortSignal,
+								onPart: sendOptions.onPart,
+							});
+						});
+					})();
+				}
 				return withSessionLock(id, async () => {
 					await storage.append(id, {
 						type: "user-message",
 						at: new Date().toISOString(),
-						message: toUserMessage(content),
+						message,
 						meta: sendOptions.meta,
 					});
-					return runLoop<TOOLS>({
-						sessionId: id,
-						agent,
-						storage,
-						getModel,
-						emit: options.onEvent,
+					return execRun<TOOLS>(id, agent, {
 						abortSignal: sendOptions.abortSignal,
 						onPart: sendOptions.onPart,
 					});
@@ -158,16 +257,11 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			resume(resumeOptions = {}) {
 				return withSessionLock(id, async () => {
 					const replayed = replaySession(await storage.load(id));
-					if (!replayed.interruptedRunId) return null;
-					return runLoop<TOOLS>({
-						sessionId: id,
-						agent,
-						storage,
-						getModel,
-						emit: options.onEvent,
+					if (!replayed.interruptedRunId && replayed.pendingMessages === 0) return null;
+					return execRun<TOOLS>(id, agent, {
 						abortSignal: resumeOptions.abortSignal,
 						onPart: resumeOptions.onPart,
-						resumeRunId: replayed.interruptedRunId,
+						resumeRunId: replayed.interruptedRunId ?? undefined,
 					});
 				});
 			},
@@ -182,7 +276,8 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				};
 			},
 			async isInterrupted() {
-				return replaySession(await storage.load(id)).interruptedRunId !== null;
+				const replayed = replaySession(await storage.load(id));
+				return replayed.interruptedRunId !== null || replayed.pendingMessages > 0;
 			},
 		};
 	}
@@ -307,12 +402,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				}
 			}
 
-			const result = await runLoop<ToolSet>({
-				sessionId,
-				agent,
-				storage,
-				getModel,
-				emit: options.onEvent,
+			const result = await execRun<ToolSet>(sessionId, agent, {
 				abortSignal: taskOptions.abortSignal,
 				onPart: taskOptions.onPart as (part: TextStreamPart<ToolSet>) => void,
 				isSettled: () => settled !== null,
@@ -343,12 +433,42 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			const ids = (await storage.listSessions?.()) ?? [];
 			const interrupted: string[] = [];
 			for (const id of ids) {
-				if (replaySession(await storage.load(id)).interruptedRunId) interrupted.push(id);
+				const replayed = replaySession(await storage.load(id));
+				if (replayed.interruptedRunId || replayed.pendingMessages > 0) interrupted.push(id);
 			}
 			return interrupted;
 		},
 		storage,
 	};
+}
+
+// Did any step land after this queued message? Used by the send() fallback
+// when its enqueue lost the race with the run's exit: a step after the
+// message means the ending run's final pass replayed (and answered) it, so
+// starting another run would answer it twice.
+function queuedMessageAnswered(events: StoredEvent[], queueId: string): boolean {
+	let seen = false;
+	for (const event of events) {
+		if (event.type === "user-message" && event.meta?.queueId === queueId) {
+			seen = true;
+			continue;
+		}
+		if (seen && event.type === "step") return true;
+	}
+	return false;
+}
+
+function lastAssistantText(messages: ModelMessage[]): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "assistant") continue;
+		if (typeof message.content === "string") return message.content;
+		return (message.content as Array<{ type?: string; text?: string }>)
+			.filter((part) => part.type === "text")
+			.map((part) => part.text ?? "")
+			.join("");
+	}
+	return "";
 }
 
 // Scan a replayed conversation for an already-settled task outcome: a

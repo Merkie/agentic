@@ -12,6 +12,14 @@ export interface ReplayedSession {
 	totals: UsageTotals;
 	/** runId of a run that started but never ended (crash/kill), if any. */
 	interruptedRunId: string | null;
+	/**
+	 * User messages with no model response yet — queued messages a crash
+	 * orphaned before (or during) their run. A run-end of any status clears
+	 * them: completed answered them, cancelled/failed settled them
+	 * deliberately (auto-resuming those would re-run an abort or replay a
+	 * failure on every boot).
+	 */
+	pendingMessages: number;
 	/** How many malformed parts the sanitizer had to repair on load. */
 	repaired: number;
 }
@@ -25,16 +33,19 @@ export interface ReplayedSession {
 export function replaySession(events: StoredEvent[]): ReplayedSession {
 	let messages: ModelMessage[] = [];
 	let totals = emptyTotals();
+	let pendingMessages = 0;
 	const openRuns = new Map<string, true>();
 
 	for (const event of events) {
 		switch (event.type) {
 			case "user-message":
 				messages.push(event.message);
+				pendingMessages += 1;
 				break;
 			case "step":
 				messages.push(...event.messages);
 				totals = addStepToTotals(totals, event.usage);
+				pendingMessages = 0;
 				break;
 			case "compaction":
 				messages = [...event.messages];
@@ -49,6 +60,7 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 				break;
 			case "run-end":
 				openRuns.delete(event.runId);
+				pendingMessages = 0;
 				break;
 		}
 	}
@@ -61,6 +73,7 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 		contextTokens: totals.contextTokens,
 		totals,
 		interruptedRunId: lastOpen,
+		pendingMessages,
 		repaired: sanitized.removed,
 	};
 }

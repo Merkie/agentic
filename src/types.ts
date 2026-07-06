@@ -183,6 +183,8 @@ export type AgenticEvent =
 	  }
 	| { type: "compaction"; sessionId: string; beforeTokens: number | null; summaryChars: number }
 	| { type: "poke"; sessionId: string; runId: string; poke: number; maxPokes: number }
+	/** A send() landed while a run was live and was queued into it. */
+	| { type: "queued-message"; sessionId: string; runId: string | null }
 	| {
 			type: "run-end";
 			sessionId: string;
