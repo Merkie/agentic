@@ -20,16 +20,7 @@ rmSync(DIR, { recursive: true, force: true });
 
 const agentic = createAgentic({
 	storage: fileStorage(DIR),
-	onEvent: (e) => {
-		if (e.type === "step")
-			console.log(
-				`  [step] ${e.finishReason} tools=${e.toolCalls.map((t) => t.toolName).join(",") || "-"}`,
-			);
-		else if (e.type === "queued-message") console.log(`  [queued-message] into run ${e.runId}`);
-		else if (e.type === "run-start") console.log(`  [run-start] ${e.runId}`);
-		else if (e.type === "run-end")
-			console.log(`  [run-end] ${e.status} cost=$${e.totals.cost.toFixed(6)}`);
-	},
+	logs: true,
 });
 
 const agent = {

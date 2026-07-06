@@ -87,10 +87,12 @@ const outcome = await agentic.task({
 ```
 
 Every session — chats, workflows, one-shots — shares the same ledger, so all
-of it is resumable, auditable, and cost-tracked. Observability is one hook:
+of it is resumable, auditable, and cost-tracked. Observability is one flag —
+or one hook:
 
 ```ts
-createAgentic({ onEvent: (e) => log(e) })
+createAgentic({ logs: true })            // colored console line per event
+createAgentic({ onEvent: (e) => log(e) })  // or ship them anywhere
 // run-start · step · retry · compaction · poke · queued-message · run-end
 ```
 
@@ -102,7 +104,7 @@ Everything the harness is built from is exported for use with plain
 | Helper | What it does |
 |---|---|
 | `createOpenRouter` | drop-in provider factory with usage accounting on |
-| `logStream` | pretty-print a full stream with live token/cost accounting |
+| `logEvents` | the default console logger (`logs: true`), usable as an `onEvent` directly |
 | `withRetries(fn)` | retry any model call on transient failures, fail fast on deterministic ones |
 | `classifyFailure(err)` | `transient` \| `context-overflow` \| `fatal` (+ Retry-After) |
 | `createResilientFetch` | header + SSE-idle stall detection for hung connections |
@@ -117,6 +119,7 @@ Everything the harness is built from is exported for use with plain
 `.env`):
 
 ```bash
+npx tsx playground/boilerplate.ts          # the smallest useful setup — copy me
 npx tsx playground/mvp/demo-task.ts        # schema self-heal + guaranteed outcome
 npx tsx playground/mvp/demo-chaos.ts       # injected 500s + severed SSE mid-run
 npx tsx playground/mvp/demo-restart.ts     # SIGKILL mid-run → resume in new process

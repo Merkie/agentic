@@ -12,16 +12,7 @@ const DIR = "./playground/mvp/.restart-demo";
 const phase = process.argv[2] ?? "orchestrate";
 
 function buildAgentic() {
-	return createAgentic({
-		storage: fileStorage(DIR),
-		onEvent: (e) => {
-			if (e.type === "step")
-				console.log(
-					`  [step] ${e.finishReason} tools=${e.toolCalls.map((t) => t.toolName).join(",") || "-"}`,
-				);
-			else if (e.type === "run-end") console.log(`  [run-end] ${e.status}`);
-		},
-	});
+	return createAgentic({ storage: fileStorage(DIR), logs: true });
 }
 
 const agentConfig = {

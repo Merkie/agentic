@@ -45,17 +45,7 @@ const chaosFetch: typeof fetch = async (input, init) => {
 const agentic = createAgentic({
 	storage: memoryStorage(),
 	fetchTimeouts: { fetch: chaosFetch },
-	onEvent: (e) => {
-		if (e.type === "step")
-			console.log(
-				`  [step] ${e.finishReason} tools=${e.toolCalls.map((t) => t.toolName).join(",") || "-"}`,
-			);
-		else if (e.type === "retry")
-			console.log(
-				`  [retry ${e.attempt}/${e.maxAttempts}] wait ${e.delayMs}ms — ${e.error.message?.slice(0, 80)}`,
-			);
-		else if (e.type === "run-end") console.log(`  [run-end] ${e.status}`);
-	},
+	logs: true,
 });
 
 const session = agentic.session("chaos-demo", {

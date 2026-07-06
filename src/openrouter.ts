@@ -11,7 +11,7 @@ import {
  * (including reading `OPENROUTER_API_KEY` from the environment) — with exactly
  * one thing added: `extraBody.usage.include` defaults to `true`, which tells
  * OpenRouter to return cost + token accounting on every response. That's what
- * powers the mid-run cost/usage tracking in {@link logStream}.
+ * powers the harness's per-step cost/usage tracking.
  *
  * Everything you pass through wins over that default — including `usage` — so it
  * stays 1:1 compatible with the upstream factory. Add your own `extraBody`, flip

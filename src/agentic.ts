@@ -3,6 +3,7 @@ import { tool } from "ai";
 import { type ZodType, z } from "zod";
 import { resolveRetryConfig, retryDelayMs, wait } from "./backoff.js";
 import { classifyFailure, serializeError } from "./failure.js";
+import { logEvents } from "./logEvents.js";
 import { getContextWindow } from "./modelMeta.js";
 import { createOpenRouter } from "./openrouter.js";
 import { replaySession } from "./replay.js";
@@ -26,6 +27,11 @@ export interface AgenticOptions {
 	storage?: StorageProvider;
 	/** Observability firehose: run/step/retry/compaction/poke events. */
 	onEvent?: EventListener;
+	/**
+	 * Log every event to the console, one colored line each (see
+	 * {@link logEvents}). Composes with onEvent — the log line prints first.
+	 */
+	logs?: boolean;
 	/** App attribution etc., sent on every request. */
 	headers?: Record<string, string>;
 	/** Provider routing etc., merged into every request body. */
@@ -174,7 +180,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			agent,
 			storage,
 			getModel,
-			emit: options.onEvent,
+			emit: emitEvent,
 			mailbox,
 			...runOptions,
 		});
@@ -188,6 +194,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 
 	const emitEvent: EventListener = (event) => {
 		try {
+			if (options.logs) logEvents(event);
 			options.onEvent?.(event);
 		} catch {
 			// a broken listener must never break a send

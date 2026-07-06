@@ -6,17 +6,7 @@ import { createAgentic, memoryStorage } from "../../src/index.js";
 
 const agentic = createAgentic({
 	storage: memoryStorage(),
-	onEvent: (e) => {
-		if (e.type === "step")
-			console.log(
-				`  [step] ${e.finishReason} tools=${e.toolCalls.map((t) => t.toolName).join(",") || "-"}`,
-			);
-		else if (e.type === "poke") console.log(`  [poke ${e.poke}/${e.maxPokes}]`);
-		else if (e.type === "retry")
-			console.log(`  [retry ${e.attempt}] in ${e.delayMs}ms: ${e.error.message}`);
-		else if (e.type === "run-end")
-			console.log(`  [run-end] ${e.status} cost=$${e.totals.cost.toFixed(6)}`);
-	},
+	logs: true,
 });
 
 const outcome = await agentic.task({

@@ -55,9 +55,7 @@
 	"scripts": {
 		"build": "tsup",
 		"dev": "tsup --watch",
-		"playground": "tsx playground/index.ts",
-		"playground:watch": "tsx watch playground/index.ts",
-		"playground:dist": "npm run build && tsx playground/index.dist.ts",
+		"playground": "tsx playground/boilerplate.ts",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"lint": "biome check .",

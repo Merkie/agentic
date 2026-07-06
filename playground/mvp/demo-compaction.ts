@@ -10,14 +10,7 @@ setContextWindow(MODEL, 4_000);
 
 const agentic = createAgentic({
 	storage: memoryStorage(),
-	onEvent: (e) => {
-		if (e.type === "step")
-			console.log(`  [step] context=${(e.usage.inputTokens ?? 0) + (e.usage.outputTokens ?? 0)}t`);
-		else if (e.type === "compaction")
-			console.log(`  [COMPACTION] before=${e.beforeTokens}t summary=${e.summaryChars} chars`);
-		else if (e.type === "run-end")
-			console.log(`  [run-end] ${e.status} $${e.totals.cost.toFixed(6)}`);
-	},
+	logs: true,
 });
 
 const session = agentic.session("compaction-demo", {

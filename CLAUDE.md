@@ -47,7 +47,8 @@ recovery, resume, message queueing, and auditing all fall out of this.
   (BYOK-aware).
 - `src/resilientFetch.ts` — header + SSE-idle stall detection.
 - `src/toolGuard.ts` — caps tool result sizes.
-- `src/logStream.ts` — pretty stream printer for demos/debugging.
+- `src/logEvents.ts` — the default console logger (`createAgentic({ logs:
+  true })`): one chalk-colored line per `AgenticEvent`.
 - `src/index.ts` — the export surface, organized in levels: Level 0
   (provider + logging), Level 1 (à-la-carte helpers), Level 2 (the harness).
 
@@ -73,14 +74,15 @@ the message in. Key invariants, in `src/run.ts`:
 
 ## Testing
 
-Tests live next to source (`src/harness.test.ts`, `src/logStream.test.ts`,
-`src/openrouter.test.ts`) and run fully offline: model calls use
+Tests live next to source (`src/harness.test.ts`, `src/openrouter.test.ts`)
+and run fully offline: model calls use
 `MockLanguageModelV3` from `ai/test` with hand-built `LanguageModelV3StreamPart`
 arrays, storage uses `memoryStorage()`, and context windows are pinned with
 `setContextWindow("mock/model", …)`. No API keys needed.
 
-`playground/mvp/` has runnable end-to-end proof demos (need
-`OPENROUTER_API_KEY` in `.env`) — see README. Demo session data
+`playground/boilerplate.ts` is the copy-me starting point (`npm run
+playground`); `playground/mvp/` has runnable end-to-end proof demos. Both
+need `OPENROUTER_API_KEY` in `.env` — see README. Demo session data
 (`playground/mvp/.queue-demo/` etc.) is gitignored.
 
 ## Releasing

@@ -1,4 +1,4 @@
-// Level 0 — drop-in OpenRouter provider + stream pretty-printer.
+// Level 0 — drop-in OpenRouter provider.
 
 // Level 2 — the harness: durable sessions, guaranteed-outcome tasks, storage.
 export {
@@ -19,7 +19,7 @@ export {
 } from "./compaction.js";
 // Level 1 — à-la-carte helpers, usable with plain streamText/generateText.
 export { classifyFailure, describeError, isContextOverflow, serializeError } from "./failure.js";
-export { logStream } from "./logStream.js";
+export { logEvents } from "./logEvents.js";
 export { getContextWindow, setContextWindow } from "./modelMeta.js";
 export {
 	createOpenRouter,
