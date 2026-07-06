@@ -64,7 +64,7 @@
 		"lint:fix": "biome check --write .",
 		"format": "biome format --write .",
 		"typecheck": "tsc --noEmit",
-		"typecheck:playground": "npm run build && tsc --noEmit -p tsconfig.playground.json",
+		"typecheck:playground": "npm run build && tsc --noEmit -p playground/tsconfig.json",
 		"prepublishOnly": "npm run build"
 	},
 	"dependencies": {

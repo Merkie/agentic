@@ -1,8 +1,8 @@
 {
-	"extends": "./tsconfig.json",
+	"extends": "../tsconfig.json",
 	"compilerOptions": {
 		"declaration": false,
 		"noEmit": true
 	},
-	"include": ["playground/**/*.ts"]
+	"include": ["**/*.ts"]
 }
