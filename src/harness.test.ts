@@ -187,6 +187,84 @@ describe("replaySession", () => {
 				.autoResumeAttempts,
 		).toBe(0);
 	});
+
+	it("keeps a queued message pending until a causal step includes its queue id", () => {
+		const events: StoredEvent[] = [
+			{ type: "user-message", at: "t0", message: { role: "user", content: "A" } },
+			{ type: "run-start", at: "t1", runId: "r1", model: "m" },
+			{
+				type: "user-message",
+				at: "t2",
+				message: { role: "user", content: "B" },
+				meta: { queued: true, queueId: "q-b" },
+			},
+			{
+				type: "step",
+				at: "t3",
+				runId: "r1",
+				messages: [{ role: "assistant", content: "answer to A" }],
+				inputQueueIds: [],
+				finishReason: "stop",
+				usage: usage(),
+			},
+			{ type: "run-end", at: "t4", runId: "r1", status: "failed" },
+		];
+
+		const pending = replaySession(events);
+		expect(pending.pendingQueueIds).toEqual(["q-b"]);
+		expect(pending.pendingMessages).toBe(1);
+
+		const answered = replaySession([
+			...events,
+			{ type: "run-start", at: "t5", runId: "r2", model: "m" },
+			{
+				type: "step",
+				at: "t6",
+				runId: "r2",
+				messages: [{ role: "assistant", content: "answer to B" }],
+				inputQueueIds: ["q-b"],
+				finishReason: "stop",
+				usage: usage(),
+			},
+			{ type: "run-end", at: "t7", runId: "r2", status: "completed" },
+		]);
+		expect(answered.pendingQueueIds).toEqual([]);
+		expect(answered.pendingMessages).toBe(0);
+	});
+
+	it("retains auto-resume attempts while failed queued work remains pending", () => {
+		const replayed = replaySession([
+			{
+				type: "user-message",
+				at: "t0",
+				message: { role: "user", content: "queued" },
+				meta: { queued: true, queueId: "q-1" },
+			},
+			{ type: "run-resume", at: "t1", runId: null, auto: true },
+			{ type: "run-start", at: "t2", runId: "r1", model: "m" },
+			{ type: "run-end", at: "t3", runId: "r1", status: "failed" },
+		]);
+
+		expect(replayed.pendingQueueIds).toEqual(["q-1"]);
+		expect(replayed.autoResumeAttempts).toBe(1);
+	});
+
+	it("does not treat an app-owned meta.queueId as framework queue state", () => {
+		const replayed = replaySession([
+			{
+				type: "user-message",
+				at: "t0",
+				message: { role: "user", content: "ordinary input" },
+				meta: { queueId: "domain-id" },
+			},
+			{ type: "run-start", at: "t1", runId: "r1", model: "m" },
+			{ type: "run-end", at: "t2", runId: "r1", status: "failed" },
+		]);
+
+		expect(replayed.pendingQueueIds).toEqual([]);
+		expect(replayed.pendingMessages).toBe(0);
+		expect(replayed.interruptedRunId).toBeNull();
+	});
 });
 
 describe("sanitizeConversation", () => {
@@ -368,6 +446,146 @@ describe("validated tasks", () => {
 			}),
 		);
 	});
+
+	it("closes a persisted submitted outcome without another model call", async () => {
+		const storage = memoryStorage();
+		await storage.append("settled-submit", {
+			type: "run-start",
+			at: "t0",
+			runId: "r-submit",
+			model: "mock/settled-submit",
+		});
+		await storage.append("settled-submit", {
+			type: "step",
+			at: "t1",
+			runId: "r-submit",
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "tool-call",
+							toolCallId: "submit",
+							toolName: "submit_deliverable",
+							input: { deliverable: { value: "kept" } },
+						},
+					],
+				},
+				{
+					role: "tool",
+					content: [
+						{
+							type: "tool-result",
+							toolCallId: "submit",
+							toolName: "submit_deliverable",
+							output: { type: "json", value: { accepted: true } },
+						},
+					],
+				},
+			],
+			inputQueueIds: [],
+			finishReason: "tool-calls",
+			usage: usage(),
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model should not run");
+			},
+		});
+		const options = {
+			id: "settled-submit",
+			agent: { model: "mock/settled-submit" },
+			prompt: "ignored",
+			deliverable: z.object({ value: z.string() }),
+		};
+
+		const failingRuntime = createAgentic({
+			storage: {
+				...storage,
+				append: async (sessionId: string, event: StoredEvent) => {
+					if (event.type === "run-end") throw new Error("reconciliation write failed");
+					await storage.append(sessionId, event);
+				},
+			},
+			getModel: () => model,
+		});
+		await expect(failingRuntime.task(options)).rejects.toThrow("reconciliation write failed");
+		expect(replaySession(await storage.load(options.id)).interruptedRunId).toBe("r-submit");
+
+		const recovered = createAgentic({ storage, getModel: () => model });
+		await expect(recovered.task(options)).resolves.toMatchObject({
+			status: "submitted",
+			deliverable: { value: "kept" },
+		});
+		expect(calls).toBe(0);
+		expect(replaySession(await storage.load(options.id)).interruptedRunId).toBeNull();
+	});
+
+	it("closes a persisted cancelled outcome without another model call", async () => {
+		const storage = memoryStorage();
+		await storage.append("settled-cancel", {
+			type: "run-start",
+			at: "t0",
+			runId: "r-cancel",
+			model: "mock/settled-cancel",
+		});
+		await storage.append("settled-cancel", {
+			type: "step",
+			at: "t1",
+			runId: "r-cancel",
+			messages: [
+				{
+					role: "assistant",
+					content: [
+						{
+							type: "tool-call",
+							toolCallId: "cancel",
+							toolName: "cancel_task",
+							input: { reason: "cannot continue" },
+						},
+					],
+				},
+				{
+					role: "tool",
+					content: [
+						{
+							type: "tool-result",
+							toolCallId: "cancel",
+							toolName: "cancel_task",
+							output: { type: "json", value: { ok: true } },
+						},
+					],
+				},
+			],
+			inputQueueIds: [],
+			finishReason: "tool-calls",
+			usage: usage(),
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model should not run");
+			},
+		});
+		const agentic = createAgentic({ storage, getModel: () => model });
+
+		await expect(
+			agentic.task({
+				id: "settled-cancel",
+				agent: { model: "mock/settled-cancel" },
+				prompt: "ignored",
+			}),
+		).resolves.toMatchObject({ status: "cancelled", reason: "cannot continue" });
+		expect(calls).toBe(0);
+		expect((await storage.load("settled-cancel")).at(-1)).toMatchObject({
+			type: "run-end",
+			status: "cancelled",
+		});
+		expect(replaySession(await storage.load("settled-cancel")).interruptedRunId).toBeNull();
+	});
 });
 
 describe("ledger durability", () => {
@@ -423,9 +641,358 @@ describe("ledger durability", () => {
 			true,
 		);
 	});
+
+	it("passes AgentConfig.toolChoice through to the model call", async () => {
+		setContextWindow("mock/tool-choice", 100_000);
+		const storage = memoryStorage();
+		await storage.append("tool-choice", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "use a tool" },
+		});
+		let receivedToolChoice: unknown;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ toolChoice }) => {
+				receivedToolChoice = toolChoice;
+				return {
+					stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+						{ type: "stream-start", warnings: [] },
+						{ type: "text-start", id: "1" },
+						{ type: "text-delta", id: "1", delta: "done" },
+						{ type: "text-end", id: "1" },
+						{
+							type: "finish",
+							finishReason: { unified: "stop", raw: "stop" },
+							usage: {
+								inputTokens: {
+									total: 1,
+									noCache: 1,
+									cacheRead: undefined,
+									cacheWrite: undefined,
+								},
+								outputTokens: { total: 1, text: 1, reasoning: undefined },
+							},
+						},
+					]),
+				};
+			},
+		});
+		const lookup = tool({ inputSchema: z.object({}), execute: async () => ({ ok: true }) });
+
+		await runLoop({
+			sessionId: "tool-choice",
+			agent: { model: "mock/tool-choice", tools: { lookup }, toolChoice: "required" },
+			storage,
+			getModel: () => model,
+		});
+		expect(receivedToolChoice).toEqual({ type: "required" });
+	});
+
+	it("does not retry after visible partial output", async () => {
+		setContextWindow("mock/visible-partial", 100_000);
+		const storage = memoryStorage();
+		await storage.append("visible-partial", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "answer once" },
+		});
+		let calls = 0;
+		const deltas: string[] = [];
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				return {
+					stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+						{ type: "stream-start", warnings: [] },
+						{ type: "text-start", id: "1" },
+						{ type: "text-delta", id: "1", delta: "partial" },
+						{ type: "error", error: new Error("502 connection dropped") },
+					]),
+				};
+			},
+		});
+
+		const result = await runLoop({
+			sessionId: "visible-partial",
+			agent: { model: "mock/visible-partial", retry: { maxAttempts: 3, baseDelayMs: 0 } },
+			storage,
+			getModel: () => model,
+			onPart: (part) => {
+				if (part.type === "text-delta") deltas.push(part.text);
+			},
+		});
+
+		expect(result.status).toBe("failed");
+		expect(calls).toBe(1);
+		expect(deltas).toEqual(["partial"]);
+	});
+
+	it("serializes custom-provider step appends in invocation order", async () => {
+		const modelId = "mock/serialized-custom-storage";
+		setContextWindow(modelId, 100_000);
+		const events: StoredEvent[] = [];
+		let releaseFirstStep!: () => void;
+		const firstStepGate = new Promise<void>((resolve) => {
+			releaseFirstStep = resolve;
+		});
+		let markFirstStepStarted!: () => void;
+		const firstStepStarted = new Promise<void>((resolve) => {
+			markFirstStepStarted = resolve;
+		});
+		let stepAppends = 0;
+		const storage = {
+			async append(_sessionId: string, event: StoredEvent) {
+				if (event.type === "step" && stepAppends++ === 0) {
+					markFirstStepStarted();
+					await firstStepGate;
+				}
+				events.push(event);
+			},
+			load: async () => [...events],
+			listSessions: async () => ["serialized-custom-storage"],
+		};
+		let modelCall = 0;
+		let markSecondModelCall!: () => void;
+		const secondModelCall = new Promise<void>((resolve) => {
+			markSecondModelCall = resolve;
+		});
+		const finishPart: LanguageModelV3StreamPart = {
+			type: "finish",
+			finishReason: { unified: "stop", raw: "stop" },
+			usage: {
+				inputTokens: { total: 1, noCache: 1, cacheRead: undefined, cacheWrite: undefined },
+				outputTokens: { total: 1, text: 1, reasoning: undefined },
+			},
+		};
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				modelCall += 1;
+				if (modelCall === 1) {
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{
+								type: "tool-call",
+								toolCallId: "lookup-1",
+								toolName: "lookup",
+								input: "{}",
+							},
+							{
+								...finishPart,
+								finishReason: { unified: "tool-calls", raw: "tool_calls" },
+							},
+						]),
+					};
+				}
+				markSecondModelCall();
+				return {
+					stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+						{ type: "stream-start", warnings: [] },
+						{ type: "text-start", id: "1" },
+						{ type: "text-delta", id: "1", delta: "done" },
+						{ type: "text-end", id: "1" },
+						finishPart,
+					]),
+				};
+			},
+		});
+		const lookup = tool({ inputSchema: z.object({}), execute: async () => ({ ok: true }) });
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"serialized-custom-storage",
+			{ model: modelId, tools: { lookup } },
+		);
+
+		const result = session.send("go");
+		await Promise.all([firstStepStarted, secondModelCall]);
+		releaseFirstStep();
+		await expect(result).resolves.toMatchObject({ status: "completed", text: "done" });
+		const steps = events.filter(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(steps).toHaveLength(2);
+		expect(steps[0].finishReason).toBe("tool-calls");
+		expect(steps[1].finishReason).toBe("stop");
+		expect(events.at(-1)?.type).toBe("run-end");
+	});
+});
+
+describe("compaction with pending inputs", () => {
+	const generatedSummary = {
+		content: [{ type: "text" as const, text: "summary of earlier history" }],
+		finishReason: { unified: "stop" as const, raw: "stop" },
+		usage: {
+			inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+			outputTokens: { total: 5, text: 5, reasoning: undefined },
+		},
+		warnings: [],
+	};
+	const answerStream = () =>
+		convertArrayToReadableStream<LanguageModelV3StreamPart>([
+			{ type: "stream-start", warnings: [] },
+			{ type: "text-start", id: "1" },
+			{ type: "text-delta", id: "1", delta: "current answer" },
+			{ type: "text-end", id: "1" },
+			{
+				type: "finish",
+				finishReason: { unified: "stop", raw: "stop" },
+				usage: {
+					inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+					outputTokens: { total: 5, text: 5, reasoning: undefined },
+				},
+			},
+		]);
+
+	it.each([
+		["ordinary", false],
+		["queued", true],
+	] as const)("preserves one %s pending input across threshold compaction", async (_label, queued) => {
+		const modelId = `mock/compact-pending-${queued ? "queued" : "ordinary"}`;
+		setContextWindow(modelId, 100);
+		const storage = memoryStorage();
+		const sessionId = `compact-pending-${queued ? "queued" : "ordinary"}`;
+		await storage.append(sessionId, {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "old question" },
+		});
+		await storage.append(sessionId, {
+			type: "step",
+			at: "t1",
+			runId: "old",
+			messages: [{ role: "assistant", content: "old answer" }],
+			inputQueueIds: [],
+			finishReason: "stop",
+			usage: usage({ inputTokens: 60, outputTokens: 20, totalTokens: 80 }),
+		});
+		await storage.append(sessionId, {
+			type: "run-end",
+			at: "t2",
+			runId: "old",
+			status: "completed",
+		});
+		await storage.append(sessionId, {
+			type: "user-message",
+			at: "t3",
+			message: { role: "user", content: "current question" },
+			...(queued ? { meta: { queued: true, queueId: "q-current" } } : {}),
+		});
+		const model = new MockLanguageModelV3({
+			doGenerate: async () => generatedSummary,
+			doStream: async () => ({ stream: answerStream() }),
+		});
+
+		await expect(
+			runLoop({
+				sessionId,
+				agent: { model: modelId, compaction: { limit: 0.5, keepRecent: 0 } },
+				storage,
+				getModel: () => model,
+			}),
+		).resolves.toMatchObject({ status: "completed", text: "current answer" });
+
+		const events = await storage.load(sessionId);
+		const compaction = events.find(
+			(event): event is Extract<StoredEvent, { type: "compaction" }> => event.type === "compaction",
+		);
+		expect(compaction?.pendingInputs).toEqual([{ pendingIndex: 0, messageIndex: 1 }]);
+		const replayed = replaySession(events);
+		expect(replayed.pendingMessages).toBe(0);
+		expect(
+			replayed.messages.filter((message) =>
+				JSON.stringify(message.content).includes("current question"),
+			),
+		).toHaveLength(1);
+		const finalStep = [...events]
+			.reverse()
+			.find((event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step");
+		expect(finalStep?.inputQueueIds).toEqual(queued ? ["q-current"] : []);
+	});
+
+	it("preserves an ordinary pending input across forced overflow compaction", async () => {
+		const modelId = "mock/compact-pending-forced";
+		setContextWindow(modelId, 100);
+		const storage = memoryStorage();
+		const sessionId = "compact-pending-forced";
+		await storage.append(sessionId, {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "old question" },
+		});
+		await storage.append(sessionId, {
+			type: "step",
+			at: "t1",
+			runId: "old",
+			messages: [{ role: "assistant", content: "old answer" }],
+			inputQueueIds: [],
+			finishReason: "stop",
+			usage: usage({ inputTokens: 10, outputTokens: 5, totalTokens: 15 }),
+		});
+		await storage.append(sessionId, {
+			type: "run-end",
+			at: "t2",
+			runId: "old",
+			status: "completed",
+		});
+		await storage.append(sessionId, {
+			type: "user-message",
+			at: "t3",
+			message: { role: "user", content: "current forced question" },
+		});
+		let streamCall = 0;
+		const model = new MockLanguageModelV3({
+			doGenerate: async () => generatedSummary,
+			doStream: async () => {
+				streamCall += 1;
+				if (streamCall === 1) {
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{
+								type: "error",
+								error: new Error("maximum context length exceeded"),
+							},
+						]),
+					};
+				}
+				return { stream: answerStream() };
+			},
+		});
+
+		await expect(
+			runLoop({
+				sessionId,
+				agent: { model: modelId, compaction: { limit: 0, keepRecent: 0 } },
+				storage,
+				getModel: () => model,
+			}),
+		).resolves.toMatchObject({ status: "completed", text: "current answer" });
+		expect(streamCall).toBe(2);
+		const replayed = replaySession(await storage.load(sessionId));
+		expect(
+			replayed.messages.filter((message) =>
+				JSON.stringify(message.content).includes("current forced question"),
+			),
+		).toHaveLength(1);
+	});
 });
 
 describe("message queueing", () => {
+	const textStream = (text: string) =>
+		convertArrayToReadableStream<LanguageModelV3StreamPart>([
+			{ type: "stream-start", warnings: [] },
+			{ type: "text-start", id: "1" },
+			{ type: "text-delta", id: "1", delta: text },
+			{ type: "text-end", id: "1" },
+			{
+				type: "finish",
+				finishReason: { unified: "stop", raw: "stop" },
+				usage: {
+					inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+					outputTokens: { total: 5, text: 5, reasoning: undefined },
+				},
+			},
+		]);
+
 	it("mailbox refuses enqueues once the run commits to ending", () => {
 		const mailbox = createMailbox();
 		expect(mailbox.tryEnqueue("q-1")).toBe(true);
@@ -433,6 +1000,144 @@ describe("message queueing", () => {
 		mailbox.accepting = false;
 		expect(mailbox.tryEnqueue("q-2")).toBe(false);
 		expect(mailbox.queued).toEqual(["q-1"]);
+	});
+
+	it("durably queues a same-tick second send before the first run registers", async () => {
+		const modelId = "mock/queue-same-tick";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const prompts: ModelMessage[][] = [];
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ prompt }) => {
+				calls += 1;
+				prompts.push(prompt as ModelMessage[]);
+				return { stream: textStream("answer to A and B") };
+			},
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session("queue-same-tick", {
+			model: modelId,
+		});
+
+		const first = session.send("A");
+		const second = session.send("B");
+		await expect(Promise.all([first, second])).resolves.toEqual([
+			expect.objectContaining({ status: "completed", text: "answer to A and B" }),
+			expect.objectContaining({ status: "completed", text: "answer to A and B" }),
+		]);
+
+		expect(calls).toBe(1);
+		const users = prompts[0].filter((message) => message.role === "user");
+		expect(users).toHaveLength(2);
+		expect(JSON.stringify(users[0].content)).toContain("A");
+		expect(JSON.stringify(users[1].content)).toContain("B");
+		const events = await storage.load("queue-same-tick");
+		expect(events.slice(0, 2).map((event) => event.type)).toEqual(["user-message", "user-message"]);
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(1);
+		expect(replaySession(events).pendingMessages).toBe(0);
+	});
+
+	it("does not run a same-tick send twice behind an idle resume reservation", async () => {
+		const modelId = "mock/resume-send-reservation";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		let calls = 0;
+		let touches = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls % 2 === 1) {
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{
+								type: "tool-call",
+								toolCallId: `touch-${calls}`,
+								toolName: "touch",
+								input: "{}",
+							},
+							{
+								type: "finish",
+								finishReason: { unified: "tool-calls", raw: "tool_calls" },
+								usage: {
+									inputTokens: {
+										total: 10,
+										noCache: 10,
+										cacheRead: undefined,
+										cacheWrite: undefined,
+									},
+									outputTokens: { total: 1, text: 0, reasoning: undefined },
+								},
+							},
+						]),
+					};
+				}
+				return { stream: textStream("done once") };
+			},
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"resume-send-reservation",
+			{
+				model: modelId,
+				tools: {
+					touch: tool({
+						inputSchema: z.object({}),
+						execute: async () => {
+							touches += 1;
+							return "touched";
+						},
+					}),
+				},
+			},
+		);
+
+		const resumed = session.resume();
+		const sent = session.send("B");
+
+		await expect(resumed).resolves.toBeNull();
+		await expect(sent).resolves.toMatchObject({ status: "completed", text: "done once" });
+		expect(touches).toBe(1);
+		expect(calls).toBe(2);
+		const events = await storage.load("resume-send-reservation");
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "run-end")).toHaveLength(1);
+	});
+
+	it("does not expose a default send to an earlier same-tick queue:false run", async () => {
+		const modelId = "mock/serialized-send-reservation";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const prompts: ModelMessage[][] = [];
+		const model = new MockLanguageModelV3({
+			doStream: async ({ prompt }) => {
+				prompts.push(prompt as ModelMessage[]);
+				return { stream: textStream(`answer-${prompts.length}`) };
+			},
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"serialized-send-reservation",
+			{ model: modelId },
+		);
+
+		const dedicated = session.send("D", { queue: false });
+		const next = session.send("B");
+
+		await expect(Promise.all([dedicated, next])).resolves.toEqual([
+			expect.objectContaining({ status: "completed", text: "answer-1" }),
+			expect.objectContaining({ status: "completed", text: "answer-2" }),
+		]);
+		expect(prompts).toHaveLength(2);
+		expect(JSON.stringify(prompts[0])).toContain("D");
+		expect(JSON.stringify(prompts[0])).not.toContain("B");
+		expect(JSON.stringify(prompts[1])).toContain("B");
+		const events = await storage.load("serialized-send-reservation");
+		const firstRunEnd = events.findIndex((event) => event.type === "run-end");
+		const bInput = events.findIndex(
+			(event) =>
+				event.type === "user-message" && JSON.stringify(event.message.content).includes("B"),
+		);
+		expect(firstRunEnd).toBeGreaterThanOrEqual(0);
+		expect(bInput).toBeGreaterThan(firstRunEnd);
 	});
 
 	it("runLoop answers a message queued mid-run, hoisted after model output", async () => {
@@ -511,7 +1216,741 @@ describe("message queueing", () => {
 		expect(mailbox.queued).toHaveLength(0);
 		expect(mailbox.accepting).toBe(false);
 		// and the whole thing replays with nothing pending
+		const finalReplay = replaySession(events);
+		expect(finalReplay.pendingMessages).toBe(0);
+		expect(finalReplay.messages.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"user",
+			"assistant",
+		]);
+	});
+
+	it("re-drives an accepted queued send when the live run fails before pickup", async () => {
+		const modelId = "mock/queue-fail-before-pickup";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let markQueued!: () => void;
+		const queued = new Promise<void>((resolve) => {
+			markQueued = resolve;
+		});
+		const prompts: ModelMessage[][] = [];
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ prompt }) => {
+				calls += 1;
+				prompts.push(prompt as ModelMessage[]);
+				if (calls === 1) {
+					markFirstStarted();
+					await firstGate;
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{ type: "error", error: new Error("Invalid API key") },
+						]),
+					};
+				}
+				return { stream: textStream("answer to B") };
+			},
+		});
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message") markQueued();
+			},
+		});
+		const session = agentic.session("queue-fail-before-pickup", { model: modelId });
+
+		const first = session.send("A");
+		await firstStarted;
+		const second = session.send("B");
+		await queued;
+		releaseFirst();
+
+		await expect(first).resolves.toMatchObject({ status: "failed" });
+		await expect(second).resolves.toMatchObject({ status: "completed", text: "answer to B" });
+		expect(calls).toBe(2);
+		expect(prompts[1].at(-1)?.role).toBe("user");
+		expect(JSON.stringify(prompts[1].at(-1)?.content)).toContain("B");
+		const events = await storage.load("queue-fail-before-pickup");
+		const queueId = (
+			events.find(
+				(event) => event.type === "user-message" && event.meta?.queued === true,
+			) as Extract<StoredEvent, { type: "user-message" }>
+		).meta?.queueId;
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(2);
+		expect(
+			events.some(
+				(event) =>
+					event.type === "step" &&
+					typeof queueId === "string" &&
+					event.inputQueueIds?.includes(queueId),
+			),
+		).toBe(true);
 		expect(replaySession(events).pendingMessages).toBe(0);
+	});
+
+	it("reconciles a queued final answer when the original run-end write fails", async () => {
+		const modelId = "mock/queue-final-run-end-failure";
+		setContextWindow(modelId, 100_000);
+		const baseStorage = memoryStorage();
+		let rejectedRunEnd = false;
+		const storage = {
+			async append(sessionId: string, event: StoredEvent) {
+				if (event.type === "run-end" && !rejectedRunEnd) {
+					rejectedRunEnd = true;
+					throw new Error("run-end write failed");
+				}
+				await baseStorage.append(sessionId, event);
+			},
+			load: (sessionId: string) => baseStorage.load(sessionId),
+		};
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let markQueued!: () => void;
+		const queued = new Promise<void>((resolve) => {
+			markQueued = resolve;
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls === 1) {
+					markFirstStarted();
+					await firstGate;
+					return { stream: textStream("answer to A") };
+				}
+				return { stream: textStream("durable answer to B") };
+			},
+		});
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message") markQueued();
+			},
+		});
+		const session = agentic.session("queue-final-run-end-failure", { model: modelId });
+
+		const first = session.send("A");
+		await firstStarted;
+		const second = session.send("B");
+		await queued;
+		releaseFirst();
+
+		await expect(first).rejects.toThrow("run-end write failed");
+		await expect(second).resolves.toMatchObject({
+			status: "completed",
+			text: "durable answer to B",
+		});
+		expect(calls).toBe(2);
+		const events = await storage.load("queue-final-run-end-failure");
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "run-end")).toHaveLength(1);
+		expect(replaySession(events).interruptedRunId).toBeNull();
+		expect(replaySession(events).pendingMessages).toBe(0);
+	});
+
+	it("resumes the open run when terminal persistence fails before queued pickup", async () => {
+		const modelId = "mock/queue-pending-run-end-failure";
+		setContextWindow(modelId, 100_000);
+		const baseStorage = memoryStorage();
+		let rejectedRunEnd = false;
+		const storage = {
+			async append(sessionId: string, event: StoredEvent) {
+				if (event.type === "run-end" && !rejectedRunEnd) {
+					rejectedRunEnd = true;
+					throw new Error("run-end write failed");
+				}
+				await baseStorage.append(sessionId, event);
+			},
+			load: (sessionId: string) => baseStorage.load(sessionId),
+		};
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let markQueued!: () => void;
+		const queued = new Promise<void>((resolve) => {
+			markQueued = resolve;
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls === 1) {
+					markFirstStarted();
+					await firstGate;
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{ type: "error", error: new Error("Invalid API key") },
+						]),
+					};
+				}
+				return { stream: textStream("recovered answer to B") };
+			},
+		});
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message") markQueued();
+			},
+		});
+		const session = agentic.session("queue-pending-run-end-failure", { model: modelId });
+
+		const first = session.send("A");
+		await firstStarted;
+		const second = session.send("B");
+		await queued;
+		releaseFirst();
+
+		await expect(first).rejects.toThrow("run-end write failed");
+		await expect(second).resolves.toMatchObject({
+			status: "completed",
+			text: "recovered answer to B",
+		});
+		expect(calls).toBe(2);
+		const events = await storage.load("queue-pending-run-end-failure");
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "run-resume")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "run-end")).toHaveLength(1);
+		const replayed = replaySession(events);
+		expect(replayed.interruptedRunId).toBeNull();
+		expect(replayed.pendingMessages).toBe(0);
+	});
+
+	it("keeps a shared run alive when its initiator aborts after another caller queues", async () => {
+		const modelId = "mock/queue-abort-after-inflight";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const abort = new AbortController();
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let markQueued!: () => void;
+		const queued = new Promise<void>((resolve) => {
+			markQueued = resolve;
+		});
+		let calls = 0;
+		let aborted = false;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls === 1) {
+					markFirstStarted();
+					await firstGate;
+					return { stream: textStream("answer to A") };
+				}
+				return { stream: textStream("answer to B") };
+			},
+		});
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message") markQueued();
+				if (event.type === "step" && !aborted) {
+					aborted = true;
+					abort.abort(new Error("stop A after its step"));
+				}
+			},
+		});
+		const session = agentic.session("queue-abort-after-inflight", { model: modelId });
+
+		const first = session.send("A", { abortSignal: abort.signal });
+		await firstStarted;
+		const second = session.send("B");
+		await queued;
+		releaseFirst();
+
+		await expect(first).resolves.toMatchObject({ status: "completed", text: "answer to B" });
+		await expect(second).resolves.toMatchObject({ status: "completed", text: "answer to B" });
+		const events = await storage.load("queue-abort-after-inflight");
+		const steps = events.filter(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(steps).toHaveLength(2);
+		expect(steps[0].inputQueueIds).toEqual([]);
+		expect(steps[1].inputQueueIds).toHaveLength(1);
+		expect(calls).toBe(2);
+		expect(replaySession(events).pendingMessages).toBe(0);
+	});
+
+	it("activates a queued listener only when a pass causally includes its input", async () => {
+		const modelId = "mock/queue-listener-gating";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let markQueued!: () => void;
+		const queued = new Promise<void>((resolve) => {
+			markQueued = resolve;
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls === 1) {
+					markFirstStarted();
+					await firstGate;
+					return { stream: textStream("answer to A") };
+				}
+				return { stream: textStream("answer to B") };
+			},
+		});
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message") markQueued();
+			},
+		});
+		const session = agentic.session("queue-listener-gating", { model: modelId });
+		const queuedDeltas: string[] = [];
+
+		const first = session.send("A");
+		await firstStarted;
+		const second = session.send("B", {
+			onPart: (part) => {
+				if (part.type === "text-delta") queuedDeltas.push(part.text);
+			},
+		});
+		await queued;
+		releaseFirst();
+
+		await Promise.all([first, second]);
+		expect(queuedDeltas).toEqual(["answer to B"]);
+		expect(calls).toBe(2);
+	});
+
+	it("collapses multiple unseen queued sends into one recovery run and streams it to both", async () => {
+		const modelId = "mock/queue-batch-recovery";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const recoveryWinnerAbort = new AbortController();
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let queuedCount = 0;
+		let markBothQueued!: () => void;
+		const bothQueued = new Promise<void>((resolve) => {
+			markBothQueued = resolve;
+		});
+		let releaseRecovery!: () => void;
+		const recoveryGate = new Promise<void>((resolve) => {
+			releaseRecovery = resolve;
+		});
+		let markRecoveryStarted!: () => void;
+		const recoveryStarted = new Promise<void>((resolve) => {
+			markRecoveryStarted = resolve;
+		});
+		let recoverySignal: AbortSignal | undefined;
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => {
+				calls += 1;
+				if (calls === 1) {
+					markFirstStarted();
+					await firstGate;
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{ type: "error", error: new Error("Invalid API key") },
+						]),
+					};
+				}
+				recoverySignal = abortSignal;
+				markRecoveryStarted();
+				await recoveryGate;
+				return { stream: textStream("answer to B and C") };
+			},
+		});
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message" && ++queuedCount === 2) markBothQueued();
+			},
+		});
+		const session = agentic.session("queue-batch-recovery", { model: modelId });
+		const bDeltas: string[] = [];
+		const cDeltas: string[] = [];
+
+		const first = session.send("A");
+		await firstStarted;
+		const second = session.send("B", {
+			abortSignal: recoveryWinnerAbort.signal,
+			onPart: (part) => {
+				if (part.type === "text-delta") bDeltas.push(part.text);
+			},
+		});
+		const third = session.send("C", {
+			onPart: (part) => {
+				if (part.type === "text-delta") cDeltas.push(part.text);
+			},
+		});
+		await bothQueued;
+		releaseFirst();
+		await recoveryStarted;
+		recoveryWinnerAbort.abort(new Error("B disconnected"));
+		await Promise.resolve();
+		expect(recoverySignal).toBeInstanceOf(AbortSignal);
+		expect(recoverySignal?.aborted).toBe(false);
+		releaseRecovery();
+
+		await expect(first).resolves.toMatchObject({ status: "failed" });
+		await expect(Promise.all([second, third])).resolves.toEqual([
+			expect.objectContaining({ status: "completed", text: "answer to B and C" }),
+			expect.objectContaining({ status: "completed", text: "answer to B and C" }),
+		]);
+		const events = await storage.load("queue-batch-recovery");
+		const queuedIds = events.flatMap((event) =>
+			event.type === "user-message" && typeof event.meta?.queueId === "string"
+				? [event.meta.queueId]
+				: [],
+		);
+		const recoverySteps = events.filter(
+			(event) => event.type === "step" && event.inputQueueIds?.length === 2,
+		);
+		expect(calls).toBe(2);
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(2);
+		expect(recoverySteps).toHaveLength(1);
+		expect((recoverySteps[0] as Extract<StoredEvent, { type: "step" }>).inputQueueIds).toEqual(
+			queuedIds,
+		);
+		expect(bDeltas).toContain("answer to B and C");
+		expect(cDeltas).toContain("answer to B and C");
+		expect(replaySession(events).pendingMessages).toBe(0);
+	});
+
+	it("returns a recovered batch's persisted failure to every queued caller", async () => {
+		const modelId = "mock/queue-batch-failure";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let queuedCount = 0;
+		let markBothQueued!: () => void;
+		const bothQueued = new Promise<void>((resolve) => {
+			markBothQueued = resolve;
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls === 1) {
+					markFirstStarted();
+					await firstGate;
+				}
+				if (calls === 2) {
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{
+								type: "tool-call",
+								toolCallId: "touch-1",
+								toolName: "touch",
+								input: "{}",
+							},
+							{
+								type: "finish",
+								finishReason: { unified: "tool-calls", raw: "tool_calls" },
+								usage: {
+									inputTokens: {
+										total: 10,
+										noCache: 10,
+										cacheRead: undefined,
+										cacheWrite: undefined,
+									},
+									outputTokens: { total: 1, text: 0, reasoning: undefined },
+								},
+							},
+						]),
+					};
+				}
+				return {
+					stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+						{ type: "stream-start", warnings: [] },
+						{ type: "error", error: new Error("Invalid API key") },
+					]),
+				};
+			},
+		});
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message" && ++queuedCount === 2) markBothQueued();
+			},
+		});
+		const session = agentic.session("queue-batch-failure", {
+			model: modelId,
+			tools: {
+				touch: tool({ inputSchema: z.object({}), execute: async () => "done" }),
+			},
+		});
+
+		const first = session.send("A");
+		await firstStarted;
+		const second = session.send("B");
+		const third = session.send("C");
+		await bothQueued;
+		releaseFirst();
+
+		await expect(first).resolves.toMatchObject({ status: "failed" });
+		await expect(Promise.all([second, third])).resolves.toEqual([
+			expect.objectContaining({
+				status: "failed",
+				error: expect.objectContaining({ message: "Invalid API key" }),
+			}),
+			expect.objectContaining({
+				status: "failed",
+				error: expect.objectContaining({ message: "Invalid API key" }),
+			}),
+		]);
+		expect(calls).toBe(3);
+		const events = await storage.load("queue-batch-failure");
+		expect(
+			events.filter(
+				(event) =>
+					event.type === "step" &&
+					event.finishReason === "tool-calls" &&
+					event.inputQueueIds?.length === 2,
+			),
+		).toHaveLength(1);
+	});
+
+	it("hoists the exact queued input ahead of a later queue:false send", async () => {
+		const modelId = "mock/queue-exact-hoist";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let markQueued!: () => void;
+		const queued = new Promise<void>((resolve) => {
+			markQueued = resolve;
+		});
+		const prompts: ModelMessage[][] = [];
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ prompt }) => {
+				calls += 1;
+				prompts.push(prompt as ModelMessage[]);
+				if (calls === 1) {
+					markFirstStarted();
+					await firstGate;
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{ type: "error", error: new Error("Invalid API key") },
+						]),
+					};
+				}
+				return { stream: textStream("answer to B then C") };
+			},
+		});
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message") markQueued();
+			},
+		});
+		const session = agentic.session("queue-exact-hoist", { model: modelId });
+
+		const first = session.send("A");
+		await firstStarted;
+		const queuedSend = session.send("B");
+		await queued;
+		const serializedSend = session.send("C", { queue: false });
+		releaseFirst();
+
+		await expect(first).resolves.toMatchObject({ status: "failed" });
+		await expect(Promise.all([queuedSend, serializedSend])).resolves.toEqual([
+			expect.objectContaining({ status: "completed", text: "answer to B then C" }),
+			expect.objectContaining({ status: "completed", text: "answer to B then C" }),
+		]);
+		const userTail = prompts[1]
+			.filter((message) => message.role === "user")
+			.slice(-2)
+			.map((message) => JSON.stringify(message.content));
+		expect(userTail[0]).toContain("B");
+		expect(userTail[1]).toContain("C");
+		expect(calls).toBe(2);
+		expect(replaySession(await storage.load("queue-exact-hoist")).pendingMessages).toBe(0);
+	});
+
+	it("restart replay recovers a queue ignored by a later in-flight step", async () => {
+		const modelId = "mock/queue-restart";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		await storage.append("queue-restart", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "A" },
+		});
+		await storage.append("queue-restart", {
+			type: "run-start",
+			at: "t1",
+			runId: "r1",
+			model: modelId,
+		});
+		await storage.append("queue-restart", {
+			type: "user-message",
+			at: "t2",
+			message: { role: "user", content: "B" },
+			meta: { queued: true, queueId: "q-b" },
+		});
+		await storage.append("queue-restart", {
+			type: "step",
+			at: "t3",
+			runId: "r1",
+			messages: [{ role: "assistant", content: "answer to A" }],
+			inputQueueIds: [],
+			finishReason: "stop",
+			usage: usage(),
+		});
+		await storage.append("queue-restart", {
+			type: "run-end",
+			at: "t4",
+			runId: "r1",
+			status: "failed",
+		});
+
+		const prompts: ModelMessage[][] = [];
+		const model = new MockLanguageModelV3({
+			doStream: async ({ prompt }) => {
+				prompts.push(prompt as ModelMessage[]);
+				return { stream: textStream("answer to B") };
+			},
+		});
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+		});
+		const session = agentic.session("queue-restart", { model: modelId });
+
+		await expect(session.isInterrupted()).resolves.toBe(true);
+		await expect(session.resume()).resolves.toMatchObject({
+			status: "completed",
+			text: "answer to B",
+		});
+		expect(prompts).toHaveLength(1);
+		expect(JSON.stringify(prompts[0].at(-1)?.content)).toContain("B");
+		const replayed = replaySession(await storage.load("queue-restart"));
+		expect(replayed.pendingQueueIds).toEqual([]);
+		expect(replayed.pendingMessages).toBe(0);
+	});
+
+	it("drops a late mailbox signal after its queued input was already answered", async () => {
+		const modelId = "mock/queue-late-signal";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const mailbox = createMailbox();
+		await storage.append("queue-late-signal", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "A" },
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls === 1) {
+					await storage.append("queue-late-signal", {
+						type: "user-message",
+						at: "t1",
+						message: { role: "user", content: "B" },
+						meta: { queued: true, queueId: "q-b" },
+					});
+					await storage.append("queue-late-signal", {
+						type: "user-message",
+						at: "t2",
+						message: { role: "user", content: "X" },
+						meta: { queued: true, queueId: "q-x" },
+					});
+					mailbox.tryEnqueue("q-x");
+					return { stream: textStream("answer to A") };
+				}
+				// q-b's append is durable and this pass sees it before its delayed
+				// in-process signal arrives.
+				mailbox.tryEnqueue("q-b");
+				return { stream: textStream("answer to B and X") };
+			},
+		});
+
+		await expect(
+			runLoop({
+				sessionId: "queue-late-signal",
+				agent: { model: modelId },
+				storage,
+				getModel: () => model,
+				mailbox,
+			}),
+		).resolves.toMatchObject({ status: "completed", text: "answer to B and X" });
+		expect(calls).toBe(2);
+		expect(mailbox.queued).toEqual([]);
+		const steps = (await storage.load("queue-late-signal")).filter(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(steps[0].inputQueueIds).toEqual([]);
+		expect(steps[1].inputQueueIds).toEqual(["q-b", "q-x"]);
 	});
 
 	it("runLoop folds a queued message in after a batched parallel tool-call step", async () => {
@@ -619,6 +2058,198 @@ describe("message queueing", () => {
 	});
 });
 
+describe("crash-window finalization", () => {
+	async function seedFinalStep(
+		storage: ReturnType<typeof memoryStorage>,
+		sessionId: string,
+		finishReason = "stop",
+	): Promise<void> {
+		await storage.append(sessionId, {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "A" },
+		});
+		await storage.append(sessionId, {
+			type: "run-start",
+			at: "t1",
+			runId: "r1",
+			model: "mock/finalize",
+		});
+		await storage.append(sessionId, {
+			type: "step",
+			at: "t2",
+			runId: "r1",
+			messages: [{ role: "assistant", content: "answer to A" }],
+			inputQueueIds: [],
+			finishReason,
+			usage: usage(),
+		});
+	}
+
+	it("manual resume closes a persisted final answer without duplicating it", async () => {
+		setContextWindow("mock/finalize", 100_000);
+		const storage = memoryStorage();
+		await seedFinalStep(storage, "manual-finalize");
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model should not run");
+			},
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session("manual-finalize", {
+			model: "mock/finalize",
+		});
+
+		await expect(session.resume()).resolves.toMatchObject({
+			status: "completed",
+			text: "answer to A",
+		});
+		expect(calls).toBe(0);
+		const events = await storage.load("manual-finalize");
+		expect(events.at(-1)).toMatchObject({ type: "run-end", runId: "r1", status: "completed" });
+		expect(replaySession(events).interruptedRunId).toBeNull();
+	});
+
+	it("does not return stale text from an earlier run when finalizing a textless answer", async () => {
+		setContextWindow("mock/finalize", 100_000);
+		const storage = memoryStorage();
+		await storage.append("textless-finalize", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "old question" },
+		});
+		await storage.append("textless-finalize", {
+			type: "run-start",
+			at: "t1",
+			runId: "old-run",
+			model: "mock/finalize",
+		});
+		await storage.append("textless-finalize", {
+			type: "step",
+			at: "t2",
+			runId: "old-run",
+			messages: [{ role: "assistant", content: "stale old answer" }],
+			inputQueueIds: [],
+			finishReason: "stop",
+			usage: usage(),
+		});
+		await storage.append("textless-finalize", {
+			type: "run-end",
+			at: "t3",
+			runId: "old-run",
+			status: "completed",
+		});
+		await storage.append("textless-finalize", {
+			type: "user-message",
+			at: "t4",
+			message: { role: "user", content: "current question" },
+		});
+		await storage.append("textless-finalize", {
+			type: "run-start",
+			at: "t5",
+			runId: "current-run",
+			model: "mock/finalize",
+		});
+		await storage.append("textless-finalize", {
+			type: "step",
+			at: "t6",
+			runId: "current-run",
+			messages: [{ role: "assistant", content: "" }],
+			inputQueueIds: [],
+			finishReason: "stop",
+			usage: usage(),
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model should not run");
+			},
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session("textless-finalize", {
+			model: "mock/finalize",
+		});
+
+		await expect(session.resume()).resolves.toMatchObject({ status: "completed", text: "" });
+		expect(calls).toBe(0);
+	});
+
+	it("auto-resume finalizes a persisted clean step without a model call", async () => {
+		setContextWindow("mock/finalize", 100_000);
+		const storage = memoryStorage();
+		await seedFinalStep(storage, "auto-finalize", "content-filter");
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model should not run");
+			},
+		});
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+			autoResume: () => ({ model: "mock/finalize" }),
+		});
+
+		await agentic.resumeInterrupted();
+		expect(calls).toBe(0);
+		expect(replaySession(await storage.load("auto-finalize")).interruptedRunId).toBeNull();
+	});
+
+	it("a new send closes the old final run before starting exactly one new model turn", async () => {
+		setContextWindow("mock/finalize", 100_000);
+		const storage = memoryStorage();
+		await seedFinalStep(storage, "send-after-finalize");
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				return {
+					stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+						{ type: "stream-start", warnings: [] },
+						{ type: "text-start", id: "1" },
+						{ type: "text-delta", id: "1", delta: "answer to B" },
+						{ type: "text-end", id: "1" },
+						{
+							type: "finish",
+							finishReason: { unified: "stop", raw: "stop" },
+							usage: {
+								inputTokens: {
+									total: 1,
+									noCache: 1,
+									cacheRead: undefined,
+									cacheWrite: undefined,
+								},
+								outputTokens: { total: 1, text: 1, reasoning: undefined },
+							},
+						},
+					]),
+				};
+			},
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"send-after-finalize",
+			{ model: "mock/finalize" },
+		);
+
+		await expect(session.send("B")).resolves.toMatchObject({
+			status: "completed",
+			text: "answer to B",
+		});
+		expect(calls).toBe(1);
+		const events = await storage.load("send-after-finalize");
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(2);
+		expect(events.filter((event) => event.type === "run-end")).toHaveLength(2);
+		expect(replaySession(events).messages.map((message) => message.role)).toEqual([
+			"user",
+			"assistant",
+			"user",
+			"assistant",
+		]);
+	});
+});
+
 describe("hoistSandwichedUsers", () => {
 	const user = (content: string): ModelMessage => ({ role: "user", content });
 	const toolCalls = (...ids: string[]): ModelMessage => ({
@@ -698,6 +2329,14 @@ describe("hoistSandwichedUsers", () => {
 });
 
 describe("auto-resume", () => {
+	async function waitUntil(predicate: () => boolean | Promise<boolean>): Promise<void> {
+		for (let attempt = 0; attempt < 100; attempt++) {
+			if (await predicate()) return;
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		throw new Error("condition was not reached");
+	}
+
 	const textStream = (text: string) =>
 		convertArrayToReadableStream<LanguageModelV3StreamPart>([
 			{ type: "stream-start", warnings: [] },
@@ -733,7 +2372,7 @@ describe("auto-resume", () => {
 			at: "t2",
 			runId: "r1",
 			messages: [{ role: "assistant", content: "one…" }],
-			finishReason: "stop",
+			finishReason: "tool-calls",
 			usage: usage(),
 		});
 		// the process died here — no run-end
@@ -829,7 +2468,166 @@ describe("auto-resume", () => {
 		expect(results).toEqual([]);
 		expect(giveUps).toContain("wedged");
 		expect(modelCalls).toBe(0);
-		// the ledger is untouched — a manual resume() can still retry by hand
-		expect((await storage.load("wedged")).filter((e) => e.type === "run-resume")).toHaveLength(3);
+		const events = await storage.load("wedged");
+		expect(events.filter((e) => e.type === "run-resume")).toHaveLength(3);
+		expect(events.at(-1)).toMatchObject({
+			type: "run-end",
+			runId: "r1",
+			status: "failed",
+		});
+		expect(replaySession(events).interruptedRunId).toBeNull();
+		expect(await agentic.interruptedSessions()).toEqual([]);
+	});
+
+	it("does not discard queued-only work when automatic attempts are exhausted", async () => {
+		const storage = memoryStorage();
+		await storage.append("queued-give-up", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "keep me" },
+			meta: { queued: true, queueId: "q-1" },
+		});
+		for (let attempt = 0; attempt < 3; attempt++) {
+			await storage.append("queued-give-up", {
+				type: "run-resume",
+				at: "t",
+				runId: null,
+				auto: true,
+			});
+			await storage.append("queued-give-up", {
+				type: "run-end",
+				at: "t",
+				runId: `failed-${attempt}`,
+				status: "failed",
+			});
+		}
+		const agentic = createAgentic({
+			storage,
+			autoResume: () => ({ model: "mock/model" }),
+			getModel: () => {
+				throw new Error("model should not run");
+			},
+		});
+
+		await expect(agentic.resumeInterrupted()).resolves.toEqual([]);
+		const replayed = replaySession(await storage.load("queued-give-up"));
+		expect(replayed.pendingQueueIds).toEqual(["q-1"]);
+		expect(replayed.pendingMessages).toBe(1);
+		expect(await agentic.interruptedSessions()).toEqual(["queued-give-up"]);
+	});
+
+	it.each([
+		["configured", 2, 2],
+		["default", undefined, 4],
+	] as const)("honors the %s auto-resume concurrency cap", async (_label, configured, cap) => {
+		const modelId = `mock/concurrency-${configured ?? "default"}`;
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		let active = 0;
+		let peak = 0;
+		const releases: Array<() => void> = [];
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				active += 1;
+				peak = Math.max(peak, active);
+				await new Promise<void>((resolve) => releases.push(resolve));
+				active -= 1;
+				return { stream: textStream("resumed") };
+			},
+		});
+		const agentFor = () => ({ model: modelId });
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			autoResume: configured === undefined ? { agentFor } : { agentFor, maxConcurrent: configured },
+		});
+		// Let the automatic sweep observe the initially empty storage.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		const sessionCount = cap + 2;
+		for (let index = 0; index < sessionCount; index++) {
+			await storage.append(`concurrent-${configured ?? "default"}-${index}`, {
+				type: "user-message",
+				at: "t0",
+				message: { role: "user", content: "resume me" },
+			});
+		}
+
+		const sweep = agentic.resumeInterrupted();
+		await waitUntil(() => releases.length === cap);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(active).toBe(cap);
+		expect(releases).toHaveLength(cap);
+
+		let released = 0;
+		while (released < sessionCount) {
+			await waitUntil(() => releases.length > released);
+			const ready = releases.length;
+			for (const release of releases.slice(released, ready)) release();
+			released = ready;
+		}
+		await expect(sweep).resolves.toHaveLength(sessionCount);
+		expect(peak).toBe(cap);
+	});
+
+	it("shares the concurrency cap across racing boot and manual sweeps", async () => {
+		const modelId = "mock/concurrency-racing-sweeps";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const sessionCount = 4;
+		for (let index = 0; index < sessionCount; index++) {
+			await storage.append(`racing-sweep-${index}`, {
+				type: "user-message",
+				at: "t0",
+				message: { role: "user", content: "resume me" },
+			});
+		}
+
+		let active = 0;
+		let peak = 0;
+		const releases: Array<() => void> = [];
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				active += 1;
+				peak = Math.max(peak, active);
+				await new Promise<void>((resolve) => releases.push(resolve));
+				active -= 1;
+				return { stream: textStream("resumed") };
+			},
+		});
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+			autoResume: { agentFor: () => ({ model: modelId }), maxConcurrent: 2 },
+		});
+		await waitUntil(() => releases.length === 2);
+		// While the boot sweep holds both slots, a manual sweep sees the other
+		// sessions but must share the same runtime-wide cap.
+		const manualSweep = agentic.resumeInterrupted();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(releases).toHaveLength(2);
+
+		let released = 0;
+		while (released < sessionCount) {
+			await waitUntil(() => releases.length > released);
+			const ready = releases.length;
+			for (const release of releases.slice(released, ready)) release();
+			released = ready;
+		}
+		await manualSweep;
+		await waitUntil(async () => (await agentic.interruptedSessions()).length === 0);
+		expect(peak).toBe(2);
+	});
+
+	it("rejects a non-positive auto-resume concurrency cap", async () => {
+		const agentic = createAgentic({
+			storage: memoryStorage(),
+			autoResume: { agentFor: () => null, maxConcurrent: 0 },
+		});
+		await expect(agentic.resumeInterrupted()).rejects.toThrow(
+			"autoResume.maxConcurrent must be a positive integer",
+		);
 	});
 });

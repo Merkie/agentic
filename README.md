@@ -19,10 +19,11 @@ plumbing once, battle-tested, so your code is just models, prompts, and tools.
   persisted the moment it finishes; the agent loop is stateless over an
   append-only event ledger, so recovery from a SIGKILL mid-run is just "run
   the loop again". With `autoResume` configured, the harness sweeps storage
-  on boot and re-drives interrupted work by itself, with a ledger-counted
-  attempt cap so a run that crashes the process on resume can't wedge it
-  into a restart loop. Bring your own storage (Prisma, SQLite, Redis…) by
-  implementing two methods; JSONL file storage is built in.
+  on boot and re-drives interrupted work by itself, with four resumed runs in
+  flight by default and a ledger-counted attempt cap so a run that crashes the
+  process on resume can't wedge it into a restart loop. Bring your own storage
+  (Prisma, SQLite, Redis…) by implementing two methods; JSONL file storage is
+  built in.
 - **Workflows have guaranteed outcomes.** `task()` gives the model
   `submit_deliverable` + `cancel_task`, validates the deliverable with zod
   *inside the tool* (validation errors go back to the model as tool results
@@ -33,7 +34,9 @@ plumbing once, battle-tested, so your code is just models, prompts, and tools.
   the agent is working is appended to the ledger *first* (a crash can never
   drop it), then folded into the live run at its next step boundary; the run
   doesn't end while unanswered input is waiting. Queued messages orphaned by
-  a restart are picked up by `resume()` like any interrupted work.
+  a restart are picked up by `resume()` like any interrupted work. Concurrent
+  callers whose inputs are handled in one model pass all receive that pass's
+  real terminal status, including a later failure or cancellation.
 - **Chats outlive the context window.** Compaction triggers on real
   provider-reported token counts against the model's actual context window
   (fetched from OpenRouter), summarizes into a hand-off message, and keeps
@@ -99,6 +102,43 @@ createAgentic({ onEvent: (e) => log(e) })  // or ship them anywhere
 // auto-resume · run-end
 ```
 
+Create one `Agentic` instance per process for a given storage provider, then
+differentiate workloads with session-id namespaces and per-session agent
+configs. Locks, live-run mailboxes, and recovery state are instance-local, so
+two instances writing the same storage can start competing runs for one
+session.
+
+For recovery tuning, pass `autoResume: { agentFor, maxAttempts,
+maxConcurrent, staggerMs }`. `maxConcurrent` defaults to `4`; `staggerMs`
+still spaces the start of each resumed run, while the concurrency cap prevents
+a large interrupted backlog from creating an unbounded provider stampede.
+
+The built-in storage providers preserve binary image/audio parts. Custom
+storage adapters should persist events with `encodeEvent(event)` and restore
+them with `decodeEvent(json)` instead of plain JSON serialization. Framework
+poke reminders are stored as `user-message` events with `meta.poke`; filter
+those when projecting a user-visible transcript. Compaction summarizes older
+multimodal turns as text, so binary parts only remain verbatim when they fall
+inside `keepRecent`.
+
+Queued-input causality is recorded on each `step`; raw append order alone is
+not a transcript (an in-flight step can be persisted after a newly arrived
+user message without having seen it). Use `session.messages()` or
+`replaySession()` for projections. A durable non-error step, including a tool
+call/result step, counts as having handled the queued input it records. If the
+run later fails, callers receive that failure and the input is not replayed
+automatically, avoiding duplicate tool side effects. An input that only saw an
+empty/error step remains pending for recovery.
+
+`onPart` is a best-effort live transport, not a durable subscription. A caller
+that reconnects—or whose queued input is picked up by a different serialized
+run—should use the resolved `RunResult` and `session.messages()` as the source
+of truth; historical stream parts are not replayed from storage.
+
+When an automatic recovery reaches `maxAttempts`, queued-only work remains in
+the ledger and can still be retried with manual `resume()`; the cap prevents a
+boot loop rather than deleting accepted input.
+
 ## À-la-carte helpers
 
 Everything the harness is built from is exported for use with plain
@@ -115,6 +155,8 @@ Everything the harness is built from is exported for use with plain
 | `guardToolResultSizes` | cap tool results so one result can't blow the context window |
 | `extractStepUsage` | per-step tokens + BYOK-reconciled cost from provider metadata |
 | `getContextWindow` | a model's context length from OpenRouter, memoized |
+| `encodeEvent` / `decodeEvent` | binary-safe StoredEvent serialization for custom adapters |
+| `serializedStorage` | serialize custom-adapter operations per session |
 
 ## Local playground
 

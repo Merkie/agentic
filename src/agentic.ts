@@ -6,10 +6,10 @@ import { classifyFailure, serializeError } from "./failure.js";
 import { logEvents } from "./logEvents.js";
 import { getContextWindow } from "./modelMeta.js";
 import { createOpenRouter } from "./openrouter.js";
-import { replaySession } from "./replay.js";
+import { type ReplayedSession, replaySession } from "./replay.js";
 import { createResilientFetch, type ResilientFetchOptions } from "./resilientFetch.js";
 import { createMailbox, type RunLoopOptions, runLoop } from "./run.js";
-import { fileStorage } from "./storage.js";
+import { fileStorage, serializedStorage } from "./storage.js";
 import type {
 	AgentConfig,
 	EventListener,
@@ -40,6 +40,11 @@ export interface AutoResumeOptions {
 	 * Manual resume() calls are never capped. Default 3.
 	 */
 	maxAttempts?: number;
+	/**
+	 * Maximum auto-resumed runs in flight for this runtime. Must be a positive
+	 * integer. Default 4.
+	 */
+	maxConcurrent?: number;
 	/** Pause between resume kicks so a big boot doesn't stampede the provider. Default 0. */
 	staggerMs?: number;
 }
@@ -47,15 +52,20 @@ export interface AutoResumeOptions {
 export interface AgenticOptions {
 	/** Defaults to OPENROUTER_API_KEY from the environment. */
 	apiKey?: string;
-	/** Where sessions live. Defaults to JSONL files under ./.agentic */
+	/**
+	 * Where sessions live. Defaults to JSONL files under ./.agentic. Use one
+	 * createAgentic instance per process for a given provider: locks and live
+	 * mailboxes are instance-local.
+	 */
 	storage?: StorageProvider;
 	/**
 	 * Make crash recovery automatic: as soon as the harness is created it
 	 * sweeps storage for interrupted work (open runs, unanswered queued
 	 * messages) and resumes each session in the background, using this
 	 * resolver to map session ids back to agent configs. Pass the resolver
-	 * directly or wrap it in {@link AutoResumeOptions} to tune the attempt
-	 * cap / stagger. resumeInterrupted() runs the same sweep on demand.
+	 * directly or wrap it in {@link AutoResumeOptions} to tune the attempt cap,
+	 * concurrency, and stagger. resumeInterrupted() runs the same sweep on
+	 * demand.
 	 */
 	autoResume?: AutoResumeResolver | AutoResumeOptions;
 	/** Observability firehose: run/step/retry/compaction/poke events. */
@@ -80,6 +90,10 @@ export interface AgenticOptions {
 }
 
 export interface SendOptions<TOOLS extends ToolSet = ToolSet> {
+	/**
+	 * Best-effort live stream callback. Parts are not replayed from the ledger;
+	 * the resolved RunResult/session.messages() remain the durable source of truth.
+	 */
 	onPart?: (part: TextStreamPart<TOOLS>) => void;
 	abortSignal?: AbortSignal;
 	/** App-supplied tag stored on the user-message event (dedup keys etc.). */
@@ -176,7 +190,7 @@ function newId(): string {
 }
 
 export function createAgentic(options: AgenticOptions = {}): Agentic {
-	const storage = options.storage ?? fileStorage();
+	const storage = serializedStorage(options.storage ?? fileStorage());
 	const openrouter = createOpenRouter({
 		apiKey: options.apiKey,
 		headers: options.headers,
@@ -199,10 +213,14 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 	function withSessionLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
 		const prev = locks.get(sessionId) ?? Promise.resolve();
 		const next = prev.then(fn, fn);
-		locks.set(
-			sessionId,
-			next.catch(() => {}),
+		const tail = next.then(
+			() => undefined,
+			() => undefined,
 		);
+		locks.set(sessionId, tail);
+		void tail.then(() => {
+			if (locks.get(sessionId) === tail) locks.delete(sessionId);
+		});
 		return next;
 	}
 
@@ -224,8 +242,27 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				"abortSignal" | "onPart" | "resumeRunId" | "isSettled" | "pokeMessage" | "maxPokes"
 			>
 		>,
+		mailbox = createMailbox(),
 	): Promise<RunResult> {
-		const mailbox = createMailbox();
+		const initiatingSignal = runOptions.abortSignal;
+		let runAbortSignal = initiatingSignal;
+		let detachAbortListener: (() => void) | undefined;
+		if (initiatingSignal) {
+			const controller = new AbortController();
+			const forwardAbort = () => {
+				// Once another durable caller joins, the initiating HTTP/client
+				// disconnect no longer owns the shared run. Its queued work must finish.
+				if (mailbox.attachedQueueIds.size === 0) {
+					controller.abort(initiatingSignal.reason);
+				}
+			};
+			if (initiatingSignal.aborted) forwardAbort();
+			else {
+				initiatingSignal.addEventListener("abort", forwardAbort, { once: true });
+				detachAbortListener = () => initiatingSignal.removeEventListener("abort", forwardAbort);
+			}
+			runAbortSignal = controller.signal;
+		}
 		const result = runLoop<TOOLS>({
 			sessionId,
 			agent,
@@ -234,9 +271,11 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			emit: emitEvent,
 			mailbox,
 			...runOptions,
+			abortSignal: runAbortSignal,
 		});
 		liveRuns.set(sessionId, { mailbox, result });
 		const cleanup = () => {
+			detachAbortListener?.();
 			if (liveRuns.get(sessionId)?.mailbox === mailbox) liveRuns.delete(sessionId);
 		};
 		result.then(cleanup, cleanup);
@@ -252,70 +291,291 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		}
 	};
 
+	async function finalizePersistedAnswer<TOOLS extends ToolSet>(
+		sessionId: string,
+		agent: AgentConfig<TOOLS>,
+		events: StoredEvent[],
+		replayed: ReplayedSession,
+	): Promise<RunResult | null> {
+		const runId = replayed.interruptedRunId;
+		if (!runId || replayed.pendingMessages > 0 || !finalizableStep(events, runId)) return null;
+
+		await storage.append(sessionId, {
+			type: "run-end",
+			at: new Date().toISOString(),
+			runId,
+			status: "completed",
+			preservePending: true,
+		});
+		const totals = {
+			...replayed.totals,
+			contextWindow: await getContextWindow(agent.model),
+		};
+		emitEvent({ type: "run-end", sessionId, runId, status: "completed", totals });
+		return {
+			status: "completed",
+			text: lastAssistantTextForRun(events, runId),
+			totals,
+		};
+	}
+
 	function session<TOOLS extends ToolSet>(id: string, agent: AgentConfig<TOOLS>): Session<TOOLS> {
+		async function finishQueuedSend(
+			queueId: string,
+			live: LiveRun,
+			sendOptions: SendOptions<TOOLS>,
+		): Promise<RunResult> {
+			let liveResult: RunResult | undefined;
+			let liveFailure: unknown;
+			try {
+				liveResult = await live.result;
+			} catch (error) {
+				liveFailure = error;
+			}
+
+			return withSessionLock(id, async () => {
+				const events = await storage.load(id);
+				const replayed = replaySession(events);
+				if (replayed.pendingQueueIds.includes(queueId)) {
+					// The prior run ended without any persisted model step whose input
+					// contained this accepted message. Re-drive it now; the session lock
+					// makes concurrent queued callers collapse into one recovery run.
+					const resumeRunId = replayed.interruptedRunId ?? undefined;
+					if (resumeRunId) {
+						// A failed run-end write leaves the original run open. Continue and
+						// close that same run instead of creating a successor while the old
+						// id remains permanently interrupted.
+						await storage.append(id, {
+							type: "run-resume",
+							at: new Date().toISOString(),
+							runId: resumeRunId,
+						});
+					}
+					const pendingQueueIds = new Set(replayed.pendingQueueIds);
+					const listeners = [
+						...live.mailbox.partListeners,
+						...live.mailbox.queuedPartListeners
+							.filter((subscription) => pendingQueueIds.has(subscription.queueId))
+							.map((subscription) => subscription.listener),
+					];
+					const recoveryOnPart =
+						listeners.length > 0
+							? (part: TextStreamPart<TOOLS>) => {
+									for (const listener of listeners) {
+										try {
+											listener(part);
+										} catch {
+											// one attached UI listener cannot block the others
+										}
+									}
+								}
+							: undefined;
+					const recoveryMailbox = createMailbox();
+					// The lock winner may disconnect, but it does not own a recovery
+					// shared with other already-durable callers. Seed their identities
+					// before execRun wires the initiating abort signal.
+					for (const pendingId of pendingQueueIds) {
+						if (pendingId !== queueId) recoveryMailbox.attachedQueueIds.add(pendingId);
+					}
+					return execRun<TOOLS>(
+						id,
+						agent,
+						{
+							abortSignal: sendOptions.abortSignal,
+							onPart: recoveryOnPart,
+							resumeRunId,
+						},
+						recoveryMailbox,
+					);
+				}
+
+				const answeredRunId = queueAnsweredByRun(events, queueId);
+				if (answeredRunId === null || answeredRunId === live.mailbox.runId) {
+					if (liveResult) return liveResult;
+					if (liveFailure !== undefined) {
+						// The model may have durably answered this queue item and only
+						// failed while appending run-end. Reconcile that final step before
+						// surfacing the storage failure to an already-answered caller.
+						if (
+							answeredRunId === live.mailbox.runId &&
+							replayed.interruptedRunId === answeredRunId
+						) {
+							const finalized = await finalizePersistedAnswer(id, agent, events, replayed);
+							if (finalized) return finalized;
+						}
+						throw liveFailure;
+					}
+				}
+
+				if (answeredRunId !== null) {
+					const terminal = terminalEventForRun(events, answeredRunId);
+					if (terminal) {
+						// Another queued caller recovered a batch containing this message
+						// while we waited for the lock. Mirror that run's durable terminal
+						// result; a tool-call step followed by failure is not completion.
+						return {
+							status: terminal.status,
+							text: lastAssistantTextForRun(events, answeredRunId),
+							totals: {
+								...replayed.totals,
+								contextWindow: await getContextWindow(agent.model),
+							},
+							error: terminal.error,
+						};
+					}
+
+					if (replayed.interruptedRunId === answeredRunId) {
+						// A crash/storage failure can leave the causally answering run open.
+						// Reconcile a clean final step, otherwise continue from its durable
+						// messages (not from the original run that missed this queue item).
+						const finalized = await finalizePersistedAnswer(id, agent, events, replayed);
+						if (finalized) return finalized;
+						return execRun<TOOLS>(id, agent, {
+							abortSignal: sendOptions.abortSignal,
+							onPart: sendOptions.onPart,
+							resumeRunId: answeredRunId,
+						});
+					}
+				}
+
+				throw new Error(
+					`Queued input ${queueId} was recorded as answered without a durable terminal run`,
+				);
+			});
+		}
+
 		return {
 			id,
 			send(content, sendOptions = {}) {
 				const message = toUserMessage(content);
 				const live = sendOptions.queue !== false ? liveRuns.get(id) : undefined;
-				if (live?.mailbox.accepting) {
+				if (live) {
+					const queueId = newId();
+					live.mailbox.attachedQueueIds.add(queueId);
 					return (async () => {
 						// Persist FIRST — the message survives even if everything
 						// after this line dies. Then signal the live run.
-						const queueId = newId();
-						await storage.append(id, {
+						try {
+							await storage.append(id, {
+								type: "user-message",
+								at: new Date().toISOString(),
+								message,
+								inputId: queueId,
+								meta: { ...sendOptions.meta, queued: true, queueId },
+							});
+						} catch (error) {
+							live.mailbox.attachedQueueIds.delete(queueId);
+							throw error;
+						}
+						if (sendOptions.onPart) {
+							live.mailbox.queuedPartListeners.push({
+								queueId,
+								listener: sendOptions.onPart as (part: unknown) => void,
+								active: false,
+							});
+						}
+						if (live.mailbox.tryEnqueue(queueId)) {
+							emitEvent({ type: "queued-message", sessionId: id, runId: live.mailbox.runId });
+							return finishQueuedSend(queueId, live, sendOptions);
+						}
+						// The run committed to ending while the append settled. Await it,
+						// then causally verify whether it saw this durable message.
+						return finishQueuedSend(queueId, live, sendOptions);
+					})();
+				}
+				if (sendOptions.queue !== false && !locks.has(id)) {
+					// Register the starting run and invoke its durable append before this
+					// call yields. A same-tick second send now sees the placeholder mailbox
+					// and takes the durable queue path instead of living only in a lock.
+					const mailbox = createMailbox();
+					let resolveLive!: (result: RunResult) => void;
+					let rejectLive!: (error: unknown) => void;
+					const liveResult = new Promise<RunResult>((resolve, reject) => {
+						resolveLive = resolve;
+						rejectLive = reject;
+					});
+					void liveResult.catch(() => {});
+					liveRuns.set(id, { mailbox, result: liveResult });
+					const inputId = newId();
+					const initialAppend = Promise.resolve(
+						storage.append(id, {
 							type: "user-message",
 							at: new Date().toISOString(),
 							message,
-							meta: { ...sendOptions.meta, queued: true, queueId },
-						});
-						if (live.mailbox.tryEnqueue(queueId)) {
-							if (sendOptions.onPart) {
-								live.mailbox.partListeners.push(sendOptions.onPart as (part: unknown) => void);
-							}
-							emitEvent({ type: "queued-message", sessionId: id, runId: live.mailbox.runId });
-							return live.result;
+							inputId,
+							meta: sendOptions.meta,
+						}),
+					);
+					const result = withSessionLock(id, async () => {
+						await initialAppend;
+						const events = await storage.load(id);
+						const inputIndex = events.findIndex(
+							(event) => event.type === "user-message" && event.inputId === inputId,
+						);
+						const priorEvents = inputIndex >= 0 ? events.slice(0, inputIndex) : events;
+						const prior = replaySession(priorEvents);
+						const finalized = await finalizePersistedAnswer(id, agent, priorEvents, prior);
+						if (prior.interruptedRunId && !finalized) {
+							await storage.append(id, {
+								type: "run-resume",
+								at: new Date().toISOString(),
+								runId: prior.interruptedRunId,
+							});
 						}
-						// The run committed to ending while the append settled. The
-						// message is safely in the ledger — give it its own run,
-						// unless the ending run's final pass already replayed it.
-						return withSessionLock(id, async () => {
-							const events = await storage.load(id);
-							if (queuedMessageAnswered(events, queueId)) {
-								const replayed = replaySession(events);
-								return {
-									status: "completed" as const,
-									text: lastAssistantText(replayed.messages),
-									totals: {
-										...replayed.totals,
-										contextWindow: await getContextWindow(agent.model),
-									},
-								};
-							}
-							return execRun<TOOLS>(id, agent, {
+						return execRun<TOOLS>(
+							id,
+							agent,
+							{
 								abortSignal: sendOptions.abortSignal,
 								onPart: sendOptions.onPart,
-							});
-						});
-					})();
+								resumeRunId:
+									prior.interruptedRunId && !finalized ? prior.interruptedRunId : undefined,
+							},
+							mailbox,
+						);
+					});
+					result.then(resolveLive, rejectLive);
+					const cleanup = () => {
+						if (liveRuns.get(id)?.mailbox === mailbox) liveRuns.delete(id);
+					};
+					result.then(cleanup, cleanup);
+					return result;
 				}
+				// queue:false always serializes. A default send also takes this path
+				// when another API operation already reserved the session lock: its
+				// input must not be appended early and then absorbed by that operation
+				// before this send starts a duplicate run.
 				return withSessionLock(id, async () => {
+					const priorEvents = await storage.load(id);
+					const prior = replaySession(priorEvents);
+					const finalized = await finalizePersistedAnswer(id, agent, priorEvents, prior);
 					await storage.append(id, {
 						type: "user-message",
 						at: new Date().toISOString(),
 						message,
 						meta: sendOptions.meta,
 					});
+					if (prior.interruptedRunId && !finalized) {
+						await storage.append(id, {
+							type: "run-resume",
+							at: new Date().toISOString(),
+							runId: prior.interruptedRunId,
+						});
+					}
 					return execRun<TOOLS>(id, agent, {
 						abortSignal: sendOptions.abortSignal,
 						onPart: sendOptions.onPart,
+						resumeRunId: prior.interruptedRunId && !finalized ? prior.interruptedRunId : undefined,
 					});
 				});
 			},
 			resume(resumeOptions = {}) {
 				return withSessionLock(id, async () => {
-					const replayed = replaySession(await storage.load(id));
+					const events = await storage.load(id);
+					const replayed = replaySession(events);
 					if (!replayed.interruptedRunId && replayed.pendingMessages === 0) return null;
+					const finalized = await finalizePersistedAnswer(id, agent, events, replayed);
+					if (finalized) return finalized;
 					await storage.append(id, {
 						type: "run-resume",
 						at: new Date().toISOString(),
@@ -450,7 +710,29 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			// (process died between the terminal tool running and run-end).
 			const prior = replaySession(await storage.load(sessionId));
 			const priorOutcome = findSettledOutcome<T>(prior.messages, schema, sessionId);
-			if (priorOutcome) return { ...priorOutcome, totals: prior.totals };
+			if (priorOutcome) {
+				if (prior.interruptedRunId) {
+					const status = priorOutcome.status === "cancelled" ? "cancelled" : "completed";
+					const error =
+						priorOutcome.status === "cancelled" ? serializeError(priorOutcome.reason) : undefined;
+					await storage.append(sessionId, {
+						type: "run-end",
+						at: new Date().toISOString(),
+						runId: prior.interruptedRunId,
+						status,
+						...(error ? { error } : {}),
+					});
+					emitEvent({
+						type: "run-end",
+						sessionId,
+						runId: prior.interruptedRunId,
+						status,
+						totals: prior.totals,
+						...(error ? { error } : {}),
+					});
+				}
+				return { ...priorOutcome, totals: prior.totals };
+			}
 
 			if (prior.messages.length === 0) {
 				const prompts =
@@ -510,31 +792,61 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		typeof options.autoResume === "function"
 			? { agentFor: options.autoResume }
 			: options.autoResume;
+	// Shared by boot and on-demand sweeps so racing resumeInterrupted() calls
+	// cannot multiply the configured provider concurrency.
+	const activeAutoResumeKicks = new Set<Promise<void>>();
 
 	// The boot sweep (halo-style): find interrupted work, re-supply configs
-	// through the resolver, and re-drive each session. Kicks are concurrent
-	// (optionally staggered); the returned promise settles when every resumed
-	// run finishes. The per-session attempt cap lives in the LEDGER, so a run
-	// that crashes the process on every resume stops being retried after
+	// through the resolver, and re-drive each session. Kicks are concurrency-
+	// capped and optionally staggered; the returned promise settles when every
+	// resumed run finishes. The per-session attempt cap lives in the LEDGER, so
+	// a run that crashes the process on every resume stops being retried after
 	// maxAttempts restarts instead of wedging the server into a boot loop.
 	async function resumeInterrupted(): Promise<RunResult[]> {
 		if (!autoResume) {
 			throw new Error("resumeInterrupted() needs createAgentic({ autoResume: ... }) configured");
 		}
 		const maxAttempts = autoResume.maxAttempts ?? 3;
+		const maxConcurrent = autoResume.maxConcurrent ?? 4;
+		if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) {
+			throw new RangeError("autoResume.maxConcurrent must be a positive integer");
+		}
 		const staggerMs = autoResume.staggerMs ?? 0;
 		const kicks: Promise<RunResult | null>[] = [];
 		for (const id of await interruptedSessions()) {
 			const replayed = replaySession(await storage.load(id));
 			const attempt = replayed.autoResumeAttempts + 1;
 			if (attempt > maxAttempts) {
-				emitEvent({
-					type: "auto-resume",
-					sessionId: id,
-					runId: replayed.interruptedRunId,
-					attempt,
-					maxAttempts,
-					action: "give-up",
+				await withSessionLock(id, async () => {
+					if (liveRuns.has(id)) return;
+					const current = replaySession(await storage.load(id));
+					const currentAttempt = current.autoResumeAttempts + 1;
+					if (currentAttempt <= maxAttempts) return;
+					emitEvent({
+						type: "auto-resume",
+						sessionId: id,
+						runId: current.interruptedRunId,
+						attempt: currentAttempt,
+						maxAttempts,
+						action: "give-up",
+					});
+					if (!current.interruptedRunId) return;
+					const error = serializeError(`Automatic resume attempt limit exhausted (${maxAttempts})`);
+					await storage.append(id, {
+						type: "run-end",
+						at: new Date().toISOString(),
+						runId: current.interruptedRunId,
+						status: "failed",
+						error,
+					});
+					emitEvent({
+						type: "run-end",
+						sessionId: id,
+						runId: current.interruptedRunId,
+						status: "failed",
+						totals: current.totals,
+						error,
+					});
 				});
 				continue;
 			}
@@ -545,6 +857,9 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				agent = null; // a broken resolver skips the session, never kills the sweep
 			}
 			if (!agent) continue;
+			while (activeAutoResumeKicks.size >= maxConcurrent) {
+				await Promise.race(activeAutoResumeKicks);
+			}
 			emitEvent({
 				type: "auto-resume",
 				sessionId: id,
@@ -554,23 +869,31 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				action: "resume",
 			});
 			const resolvedAgent = agent;
-			kicks.push(
-				withSessionLock(id, async () => {
-					// Re-check under the lock — a send() may have raced the sweep.
-					if (liveRuns.has(id)) return null;
-					const current = replaySession(await storage.load(id));
-					if (!current.interruptedRunId && current.pendingMessages === 0) return null;
-					await storage.append(id, {
-						type: "run-resume",
-						at: new Date().toISOString(),
-						runId: current.interruptedRunId,
-						auto: true,
-					});
-					return execRun<ToolSet>(id, resolvedAgent, {
-						resumeRunId: current.interruptedRunId ?? undefined,
-					});
-				}),
+			const kick = withSessionLock(id, async () => {
+				// Re-check under the lock — a send() may have raced the sweep.
+				if (liveRuns.has(id)) return null;
+				const events = await storage.load(id);
+				const current = replaySession(events);
+				if (!current.interruptedRunId && current.pendingMessages === 0) return null;
+				const finalized = await finalizePersistedAnswer(id, resolvedAgent, events, current);
+				if (finalized) return finalized;
+				await storage.append(id, {
+					type: "run-resume",
+					at: new Date().toISOString(),
+					runId: current.interruptedRunId,
+					auto: true,
+				});
+				return execRun<ToolSet>(id, resolvedAgent, {
+					resumeRunId: current.interruptedRunId ?? undefined,
+				});
+			});
+			kicks.push(kick);
+			const tracked = kick.then(
+				() => undefined,
+				() => undefined,
 			);
+			activeAutoResumeKicks.add(tracked);
+			void tracked.then(() => activeAutoResumeKicks.delete(tracked));
 			if (staggerMs > 0) await wait(staggerMs);
 		}
 		return (await Promise.all(kicks)).filter((r): r is RunResult => r !== null);
@@ -600,31 +923,64 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 	};
 }
 
-// Did any step land after this queued message? Used by the send() fallback
-// when its enqueue lost the race with the run's exit: a step after the
-// message means the ending run's final pass replayed (and answered) it, so
-// starting another run would answer it twice.
-function queuedMessageAnswered(events: StoredEvent[], queueId: string): boolean {
-	let seen = false;
+// Which run persisted the first step that causally included this queued
+// message. Sequence is insufficient: an in-flight step can land after the
+// user-message event without having seen it.
+function queueAnsweredByRun(events: StoredEvent[], queueId: string): string | null {
 	for (const event of events) {
-		if (event.type === "user-message" && event.meta?.queueId === queueId) {
-			seen = true;
-			continue;
+		if (
+			event.type === "step" &&
+			event.acknowledgesInput !== false &&
+			event.inputQueueIds?.includes(queueId)
+		) {
+			return event.runId;
 		}
-		if (seen && event.type === "step") return true;
 	}
-	return false;
+	return null;
+}
+
+function terminalEventForRun(
+	events: StoredEvent[],
+	runId: string,
+): Extract<StoredEvent, { type: "run-end" }> | null {
+	let terminal: Extract<StoredEvent, { type: "run-end" }> | null = null;
+	for (const event of events) {
+		if (event.type === "run-end" && event.runId === runId) terminal = event;
+	}
+	return terminal;
+}
+
+function lastAssistantTextForRun(events: StoredEvent[], runId: string): string {
+	return lastAssistantText(
+		events.flatMap((event) =>
+			event.type === "step" && event.runId === runId ? event.messages : [],
+		),
+	);
+}
+
+function finalizableStep(
+	events: StoredEvent[],
+	runId: string,
+): Extract<StoredEvent, { type: "step" }> | null {
+	let last: Extract<StoredEvent, { type: "step" }> | null = null;
+	for (const event of events) {
+		if (event.type === "step" && event.runId === runId) last = event;
+	}
+	return last && last.finishReason !== "tool-calls" && last.finishReason !== "error" ? last : null;
 }
 
 function lastAssistantText(messages: ModelMessage[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
 		if (message.role !== "assistant") continue;
-		if (typeof message.content === "string") return message.content;
-		return (message.content as Array<{ type?: string; text?: string }>)
-			.filter((part) => part.type === "text")
-			.map((part) => part.text ?? "")
-			.join("");
+		const text =
+			typeof message.content === "string"
+				? message.content
+				: (message.content as Array<{ type?: string; text?: string }>)
+						.filter((part) => part.type === "text")
+						.map((part) => part.text ?? "")
+						.join("");
+		if (text.trim()) return text;
 	}
 	return "";
 }

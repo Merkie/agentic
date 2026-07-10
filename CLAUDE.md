@@ -38,6 +38,8 @@ recovery, resume, message queueing, and auditing all fall out of this.
   totals + `interruptedRunId` + `pendingMessages`.
 - `src/storage.ts` — `StorageProvider` interface (`append`/`load`, optional
   `listSessions`); `fileStorage` (JSONL) and `memoryStorage` built in.
+- `src/serialize.ts` — exported binary-safe `StoredEvent` codec used by both
+  built-in providers and available to custom storage adapters.
 - `src/failure.ts` / `src/backoff.ts` — error classification
   (`transient` | `context-overflow` | `fatal`) and capped exponential backoff.
 - `src/compaction.ts` — token-threshold summarization into a hand-off message.
@@ -65,13 +67,25 @@ the message in. Key invariants, in `src/run.ts`:
   queued message is folded in; a tool-call/result pair is never split.
 - `hoistSandwichedUsers()` reorders (per-request only) a message that landed
   mid-step so the model reads it as the newest input; the ledger keeps
-  arrival order.
+  arrival order. `replaySession()` uses each step's `inputQueueIds` to make
+  the same causal projection; consumers must not treat raw append order as a
+  ready-to-display transcript.
 - A run never ends with unanswered input queued; `mailbox.accepting` flips
   false synchronously before `run-end` so a racing `send()` falls back to its
   own run.
-- Replay counts trailing unanswered messages (`pendingMessages`) so
-  `resume()`/`interruptedSessions()` recover queued messages orphaned by a
-  crash — but any `run-end` clears them (don't auto-re-run an abort/failure).
+- Replay tracks accepted queued inputs by queue id until a durable non-error
+  step explicitly records that it saw them. An empty/error step does not
+  acknowledge input. A failed/cancelled `run-end` settles its ordinary
+  initiating input but preserves queued inputs it never saw, so
+  `resume()`/`interruptedSessions()` can recover them.
+- The first durable non-error step that records a queue id counts as handling
+  it, including a tool-call/result step. If that run later fails, every joined
+  caller receives the persisted failure; the input is not automatically
+  replayed because doing so could repeat tool side effects.
+- `onPart` listeners are live-only and are not replayed from the ledger. A
+  `queue:false` call already waiting on the session lock can become the run
+  that answers older queued input; those queued callers still receive the
+  durable final result, but may not receive that run's historical deltas.
 
 ### Auto-resume (the boot sweep)
 
@@ -82,9 +96,12 @@ messages, and re-drives them. The resolver exists because agent configs hold
 tool *functions*, which can't live in storage. Guards: every resume appends a
 `run-resume` ledger event (`auto: true` for sweep-driven ones); replay counts
 them as `autoResumeAttempts`, and the sweep gives up after `maxAttempts`
-(default 3, reset by any `run-end`) so a run that crashes the process on
-resume can't wedge a restart loop. Manual `resume()` is uncapped. Sweep kicks
-re-check under the session lock, so racing sweeps/sends never double-resume.
+(default 3, reset once no queued recovery input remains) so a run that crashes
+the process on resume can't wedge a restart loop. Give-up leaves queued-only
+work durable for a later manual `resume()`. Sweeps keep at most `maxConcurrent`
+(default 4) resumed runs in flight, while `staggerMs` optionally spaces their
+starts. Manual `resume()` is uncapped. Sweep kicks re-check under the session
+lock, so racing sweeps/sends never double-resume.
 
 ## Testing
 

@@ -1,4 +1,4 @@
-import type { ModelMessage, StopCondition, ToolSet } from "ai";
+import type { ModelMessage, StopCondition, ToolChoice, ToolSet } from "ai";
 
 export type MaybePromise<T> = T | Promise<T>;
 
@@ -54,6 +54,8 @@ export type StoredEvent =
 			type: "user-message";
 			at: string;
 			message: ModelMessage;
+			/** Framework-generated identity for crash-safe intake ordering. */
+			inputId?: string;
 			/** App-supplied tag (e.g. a poke dedup key); opaque to the framework. */
 			meta?: Record<string, unknown>;
 	  }
@@ -64,6 +66,20 @@ export type StoredEvent =
 			runId: string;
 			/** The step's response messages (assistant + tool), replay-ready. */
 			messages: ModelMessage[];
+			/**
+			 * Queued user-message ids present in the model input that produced this
+			 * step. An empty array is meaningful: this step did not see a queued
+			 * message that may have arrived while it was in flight. Optional only
+			 * for backward compatibility with ledgers written before v0.5.1.
+			 */
+			inputQueueIds?: string[];
+			/**
+			 * False when the provider ended the step before producing a durable
+			 * response. Such a step records usage/error diagnostics but does not
+			 * settle any input; replay and recovery must keep that input pending.
+			 * Optional for ledgers written before v0.5.1, where steps settled input.
+			 */
+			acknowledgesInput?: boolean;
 			finishReason: string;
 			usage: StepUsage;
 	  }
@@ -72,6 +88,11 @@ export type StoredEvent =
 			at: string;
 			/** The new replay base — everything before this event is superseded. */
 			messages: ModelMessage[];
+			/**
+			 * Positions of still-pending queued inputs preserved verbatim in the
+			 * compacted message base. Lets replay retain their exact identity.
+			 */
+			pendingInputs?: Array<{ pendingIndex: number; messageIndex: number }>;
 			usage?: StepUsage;
 	  }
 	| {
@@ -88,6 +109,8 @@ export type StoredEvent =
 			at: string;
 			runId: string;
 			status: "completed" | "cancelled" | "failed";
+			/** Reconciliation close: do not settle inputs appended after this run's final step. */
+			preservePending?: boolean;
 			error?: SerializedError;
 	  };
 
@@ -151,6 +174,8 @@ export interface AgentConfig<TOOLS extends ToolSet = ToolSet> {
 	model: string;
 	system?: string;
 	tools?: TOOLS;
+	/** AI SDK tool-selection policy (`auto`, `required`, `none`, or one named tool). */
+	toolChoice?: ToolChoice<NoInfer<TOOLS>>;
 	/** Max model steps per run. */
 	maxSteps?: number;
 	/** Extra stop conditions merged with the framework's. */

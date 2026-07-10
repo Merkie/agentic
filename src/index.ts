@@ -37,7 +37,8 @@ export {
 } from "./resilientFetch.js";
 export { createMailbox, type RunLoopOptions, type RunMailbox, runLoop } from "./run.js";
 export { sanitizeConversation } from "./sanitize.js";
-export { fileStorage, memoryStorage } from "./storage.js";
+export { decodeEvent, encodeEvent } from "./serialize.js";
+export { fileStorage, memoryStorage, serializedStorage } from "./storage.js";
 export { guardToolResultSizes, type ToolGuardOptions } from "./toolGuard.js";
 export type {
 	AgentConfig,

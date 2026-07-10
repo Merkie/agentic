@@ -13,9 +13,9 @@ import {
  * OpenRouter to return cost + token accounting on every response. That's what
  * powers the harness's per-step cost/usage tracking.
  *
- * Everything you pass through wins over that default — including `usage` — so it
- * stays 1:1 compatible with the upstream factory. Add your own `extraBody`, flip
- * `usage.include` off, etc.
+ * Object-valued `usage` options win over that default, so you can add your own
+ * `extraBody`, flip `usage.include` off, etc. A primitive `usage` value is
+ * replaced with the valid `{ include: true }` shape.
  *
  * @example
  * ```ts

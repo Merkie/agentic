@@ -54,10 +54,18 @@ export interface RunMailbox {
 	 * message instead.
 	 */
 	accepting: boolean;
+	/** Durable callers attached to this shared run, including append-in-flight sends. */
+	attachedQueueIds: Set<string>;
 	/** queueIds of ledger-appended messages the loop has not yet consumed. */
 	queued: string[];
 	/** Live-stream listeners contributed by attached send() calls. */
 	partListeners: Array<(part: unknown) => void>;
+	/** Queue-id-gated listeners; activated only once a model pass includes that input. */
+	queuedPartListeners: Array<{
+		queueId: string;
+		listener: (part: unknown) => void;
+		active: boolean;
+	}>;
 	/** Signal a new ledger message. Returns false if the run stopped listening. */
 	tryEnqueue(queueId: string): boolean;
 }
@@ -66,10 +74,13 @@ export function createMailbox(): RunMailbox {
 	const mailbox: RunMailbox = {
 		runId: null,
 		accepting: true,
+		attachedQueueIds: new Set(),
 		queued: [],
 		partListeners: [],
+		queuedPartListeners: [],
 		tryEnqueue(queueId: string) {
 			if (!mailbox.accepting) return false;
+			mailbox.attachedQueueIds.add(queueId);
 			mailbox.queued.push(queueId);
 			return true;
 		},
@@ -80,7 +91,13 @@ export function createMailbox(): RunMailbox {
 function ledgerHasQueued(events: StoredEvent[], queueId: string): boolean {
 	for (let i = events.length - 1; i >= 0; i--) {
 		const event = events[i];
-		if (event.type === "user-message" && event.meta?.queueId === queueId) return true;
+		if (
+			event.type === "user-message" &&
+			event.meta?.queued === true &&
+			event.meta.queueId === queueId
+		) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -94,16 +111,22 @@ function ledgerHasQueued(events: StoredEvent[], queueId: string): boolean {
 // between a tool call and its result, which providers reject outright.
 export function hoistSandwichedUsers(messages: ModelMessage[], max: number): void {
 	if (messages.length === 0 || max <= 0) return;
-	let i = messages.length - 1;
-	if (messages[i].role === "user") return; // already trailing input
-	while (i >= 0 && (messages[i].role === "assistant" || messages[i].role === "tool")) i -= 1;
-	let start = i;
-	while (start >= 0 && messages[start].role === "user") start -= 1;
-	start += 1;
-	const count = Math.min(i - start + 1, max);
-	if (count <= 0) return;
-	const block = messages.splice(i - count + 1, count);
-	messages.push(...block);
+	const queued: ModelMessage[] = [];
+	for (let index = messages.length - 1; index >= 0 && queued.length < max; index--) {
+		if (messages[index].role !== "user") continue;
+		queued.unshift(...messages.splice(index, 1));
+	}
+	messages.push(...queued);
+}
+
+function hoistPendingInputs(messages: ModelMessage[], pending: ModelMessage[]): void {
+	const actionable: ModelMessage[] = [];
+	for (const message of pending) {
+		const index = messages.indexOf(message);
+		if (index >= 0) messages.splice(index, 1);
+		actionable.push(message);
+	}
+	messages.push(...actionable);
 }
 
 export interface RunLoopOptions<TOOLS extends ToolSet = ToolSet> {
@@ -228,13 +251,30 @@ export async function runLoop<TOOLS extends ToolSet>(
 		{ outcome: "done" | "skip" } | { outcome: "failed"; error: unknown }
 	> => {
 		const replayed = replaySession(await storage.load(sessionId));
-		if (replayed.messages.length <= compaction.keepRecent + 1) return { outcome: "skip" };
+		// Pending queued inputs must survive compaction verbatim. They can be
+		// sandwiched below an in-flight step, so causally hoist them first and
+		// expand the recent tail far enough to retain every one.
+		const pendingInputCount = replayed.pendingMessages;
+		if (pendingInputCount > 0) {
+			hoistPendingInputs(replayed.messages, replayed.pendingInputMessages);
+		}
+		const compactionForPass =
+			pendingInputCount > compaction.keepRecent
+				? { ...compaction, keepRecent: pendingInputCount }
+				: compaction;
+		if (replayed.messages.length <= compactionForPass.keepRecent + 1) {
+			return { outcome: "skip" };
+		}
 		try {
 			const compacted = await runCompaction({
 				messages: replayed.messages,
 				model: options.getModel(compaction.model ?? agent.model, agent),
-				config: compaction,
+				config: compactionForPass,
 				abortSignal: options.abortSignal,
+			});
+			const pendingInputs = replayed.pendingInputMessages.flatMap((message, pendingIndex) => {
+				const messageIndex = compacted.messages.indexOf(message);
+				return messageIndex >= 0 ? [{ pendingIndex, messageIndex }] : [];
 			});
 			await append({
 				type: "compaction",
@@ -242,6 +282,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 				messages: agent.preserveProviderOptions
 					? compacted.messages
 					: stripProviderOptions(compacted.messages),
+				pendingInputs,
 				usage: compacted.usage,
 			});
 			// cost counts; the summarizer's context size is not the live chat's
@@ -263,12 +304,21 @@ export async function runLoop<TOOLS extends ToolSet>(
 
 		const events = await storage.load(sessionId);
 		const replayed = replaySession(events);
+		const inputQueueIds = replayed.pendingQueueIds;
+		if (replayed.pendingMessages > 0) {
+			hoistPendingInputs(replayed.messages, replayed.pendingInputMessages);
+		}
+		if (mailbox && inputQueueIds.length > 0) {
+			const included = new Set(inputQueueIds);
+			for (const subscription of mailbox.queuedPartListeners) {
+				if (included.has(subscription.queueId)) subscription.active = true;
+			}
+		}
 		// Queued live pickup: consume the mailbox arrivals this snapshot has.
 		// Anything the load raced past stays queued and triggers another pass.
 		if (mailbox && mailbox.queued.length > 0) {
 			const inSnapshot = mailbox.queued.filter((id) => ledgerHasQueued(events, id));
 			if (inSnapshot.length > 0) {
-				hoistSandwichedUsers(replayed.messages, inSnapshot.length);
 				mailbox.queued = mailbox.queued.filter((id) => !inSnapshot.includes(id));
 			}
 		}
@@ -327,8 +377,10 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// ── one streamText pass ──
 		let compactPending = false;
 		let progressThisPass = false;
+		let observableProgress = false;
 		let lastFinishReason = "";
 		let streamError: unknown;
+		let queueIdsForNextStep = inputQueueIds;
 		// onStepFinish persistence is async; every pending append must settle
 		// before the next pass replays the session, or the replay races the
 		// writes it depends on.
@@ -339,6 +391,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 			system: agent.system,
 			messages: replayed.messages,
 			tools,
+			toolChoice: agent.toolChoice,
 			abortSignal: options.abortSignal,
 			// The framework owns ALL retry policy — a second retry layer inside
 			// the SDK would hide failures from the classifier and double waits.
@@ -360,6 +413,9 @@ export async function runLoop<TOOLS extends ToolSet>(
 					providerMetadata: step.providerMetadata as Record<string, unknown> | undefined,
 				});
 				const newMessages = step.response.messages.slice();
+				const acknowledgesInput = step.finishReason !== "error" && newMessages.length > 0;
+				const stepInputQueueIds = queueIdsForNextStep;
+				if (acknowledgesInput) queueIdsForNextStep = [];
 				pendingAppends.push(
 					Promise.resolve(
 						append({
@@ -369,6 +425,8 @@ export async function runLoop<TOOLS extends ToolSet>(
 							messages: agent.preserveProviderOptions
 								? newMessages
 								: stripProviderOptions(newMessages),
+							inputQueueIds: stepInputQueueIds,
+							acknowledgesInput,
 							finishReason: step.finishReason,
 							usage,
 						}),
@@ -403,6 +461,13 @@ export async function runLoop<TOOLS extends ToolSet>(
 		try {
 			for await (const part of result.fullStream) {
 				if (part.type === "error") streamError = part.error;
+				if (
+					part.type === "text-delta" ||
+					part.type === "tool-call" ||
+					part.type === "tool-result"
+				) {
+					observableProgress = true;
+				}
 				try {
 					options.onPart?.(part);
 				} catch {
@@ -413,6 +478,14 @@ export async function runLoop<TOOLS extends ToolSet>(
 						listener(part);
 					} catch {
 						// same rule for attached listeners
+					}
+				}
+				for (const subscription of mailbox?.queuedPartListeners ?? []) {
+					if (!subscription.active) continue;
+					try {
+						subscription.listener(part);
+					} catch {
+						// same rule for causally attached listeners
 					}
 				}
 			}
@@ -435,6 +508,9 @@ export async function runLoop<TOOLS extends ToolSet>(
 			const cls = classifyFailure(streamError);
 
 			if (cls.kind === "context-overflow") {
+				// Compaction replays the prompt. Once callers saw text or a tool ran,
+				// replaying could duplicate visible output or external side effects.
+				if (observableProgress) return fail(streamError);
 				if (!progressSinceForcedCompaction) {
 					return fail(streamError); // compaction already tried and didn't help
 				}
@@ -443,6 +519,9 @@ export async function runLoop<TOOLS extends ToolSet>(
 			}
 
 			if (cls.kind === "fatal") return fail(streamError);
+			// Retrying after callers saw text or a tool executed would duplicate
+			// visible output or side effects against the same prompt.
+			if (observableProgress) return fail(streamError);
 
 			// transient — bounded by attempts-without-progress and wall clock
 			if (progressThisPass) attempt = 0;
@@ -476,7 +555,15 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// Unconsumed queued messages: the run does not end while there is
 		// unanswered user input (opencode's exit rule) — unless the task has
 		// already settled, in which case the outcome stands.
-		if ((mailbox?.queued.length ?? 0) > 0 && options.isSettled?.() !== true) continue;
+		if (mailbox && mailbox.queued.length > 0 && options.isSettled?.() !== true) {
+			// A signal can arrive just after the loop independently discovered and
+			// answered its ledger message. Re-check causal pending state so that
+			// stale signal does not force a duplicate model pass.
+			const latestEvents = await storage.load(sessionId);
+			const latestPending = new Set(replaySession(latestEvents).pendingQueueIds);
+			mailbox.queued = mailbox.queued.filter((id) => latestPending.has(id));
+			if (mailbox.queued.length > 0) continue;
+		}
 
 		if (options.isSettled && !options.isSettled()) {
 			pokes += 1;
