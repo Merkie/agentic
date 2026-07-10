@@ -419,7 +419,14 @@ export async function runLoop<TOOLS extends ToolSet>(
 		} catch (err) {
 			if (streamError === undefined) streamError = err;
 		}
-		await Promise.allSettled(pendingAppends);
+		try {
+			await Promise.all(pendingAppends);
+		} catch (storageError) {
+			// A step that was not durably recorded cannot be replayed after a
+			// restart. Treat that as a run failure instead of claiming completion
+			// over state that exists only in this process.
+			return fail(storageError);
+		}
 
 		if (options.abortSignal?.aborted) return cancel(options.abortSignal.reason);
 

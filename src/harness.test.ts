@@ -222,6 +222,209 @@ describe("memoryStorage", () => {
 	});
 });
 
+describe("validated tasks", () => {
+	const finish = (reason: "stop" | "tool-calls" = "tool-calls"): LanguageModelV3StreamPart => ({
+		type: "finish",
+		finishReason: { unified: reason, raw: reason },
+		usage: {
+			inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+			outputTokens: { total: 5, text: 5, reasoning: undefined },
+		},
+	});
+
+	it("returns schema errors to the model and accepts a corrected submission", async () => {
+		setContextWindow("mock/task", 100_000);
+		const prompts: unknown[] = [];
+		let call = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ prompt }) => {
+				prompts.push(prompt);
+				call += 1;
+				const deliverable =
+					call === 1 ? { count: "not-a-number" } : { count: 3, label: "corrected" };
+				return {
+					stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+						{ type: "stream-start", warnings: [] },
+						{
+							type: "tool-call",
+							toolCallId: `submit-${call}`,
+							toolName: "submit_deliverable",
+							input: JSON.stringify({ deliverable }),
+						},
+						finish(),
+					]),
+				};
+			},
+		});
+		const storage = memoryStorage();
+		const agentic = createAgentic({
+			apiKey: "test",
+			storage,
+			getModel: () => model,
+		});
+
+		const outcome = await agentic.task({
+			id: "validated-task",
+			agent: { model: "mock/task" },
+			prompt: "Return a count and label.",
+			deliverable: z.object({ count: z.number(), label: z.string() }),
+		});
+
+		expect(outcome).toMatchObject({
+			status: "submitted",
+			deliverable: { count: 3, label: "corrected" },
+		});
+		expect(call).toBe(2);
+		expect(JSON.stringify(prompts[1])).toContain("schema validation failed");
+		expect(replaySession(await storage.load("validated-task")).pendingMessages).toBe(0);
+	});
+
+	it("replays a previously accepted outcome without calling the model again", async () => {
+		setContextWindow("mock/task-replay", 100_000);
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				return {
+					stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+						{ type: "stream-start", warnings: [] },
+						{
+							type: "tool-call",
+							toolCallId: "submit-once",
+							toolName: "submit_deliverable",
+							input: JSON.stringify({ deliverable: { value: "kept" } }),
+						},
+						finish(),
+					]),
+				};
+			},
+		});
+		const storage = memoryStorage();
+		const agentic = createAgentic({ apiKey: "test", storage, getModel: () => model });
+		const options = {
+			id: "replayed-task",
+			agent: { model: "mock/task-replay" },
+			prompt: "Return a value.",
+			deliverable: z.object({ value: z.string() }),
+		};
+
+		await expect(agentic.task(options)).resolves.toMatchObject({ status: "submitted" });
+		await expect(agentic.task(options)).resolves.toMatchObject({
+			status: "submitted",
+			deliverable: { value: "kept" },
+		});
+		expect(calls).toBe(1);
+	});
+
+	it("resumes an interrupted task under the original run id", async () => {
+		setContextWindow("mock/task-resume", 100_000);
+		const storage = memoryStorage();
+		await storage.append("interrupted-task", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "finish this" },
+		});
+		await storage.append("interrupted-task", {
+			type: "run-start",
+			at: "t1",
+			runId: "original-run",
+			model: "mock/task-resume",
+		});
+		const model = new MockLanguageModelV3({
+			doStream: async () => ({
+				stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+					{ type: "stream-start", warnings: [] },
+					{
+						type: "tool-call",
+						toolCallId: "submit-resume",
+						toolName: "submit_deliverable",
+						input: JSON.stringify({ deliverable: { done: true } }),
+					},
+					finish(),
+				]),
+			}),
+		});
+		const agentic = createAgentic({ apiKey: "test", storage, getModel: () => model });
+
+		await expect(
+			agentic.task({
+				id: "interrupted-task",
+				agent: { model: "mock/task-resume" },
+				prompt: "ignored because history exists",
+				deliverable: z.object({ done: z.boolean() }),
+			}),
+		).resolves.toMatchObject({ status: "submitted", deliverable: { done: true } });
+
+		const events = await storage.load("interrupted-task");
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(1);
+		expect(events).toContainEqual(
+			expect.objectContaining({ type: "run-resume", runId: "original-run" }),
+		);
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: "run-end",
+				runId: "original-run",
+				status: "completed",
+			}),
+		);
+	});
+});
+
+describe("ledger durability", () => {
+	it("never reports completion when persisting a finished step fails", async () => {
+		setContextWindow("mock/storage-failure", 100_000);
+		const base = memoryStorage();
+		const storage = {
+			...base,
+			append: async (sessionId: string, event: StoredEvent) => {
+				if (event.type === "step") throw new Error("database unavailable");
+				await base.append(sessionId, event);
+			},
+		};
+		await storage.append("storage-failure", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "hello" },
+		});
+		const model = new MockLanguageModelV3({
+			doStream: async () => ({
+				stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+					{ type: "stream-start", warnings: [] },
+					{ type: "text-start", id: "1" },
+					{ type: "text-delta", id: "1", delta: "unpersisted answer" },
+					{ type: "text-end", id: "1" },
+					{
+						type: "finish",
+						finishReason: { unified: "stop", raw: "stop" },
+						usage: {
+							inputTokens: {
+								total: 10,
+								noCache: 10,
+								cacheRead: undefined,
+								cacheWrite: undefined,
+							},
+							outputTokens: { total: 5, text: 5, reasoning: undefined },
+						},
+					},
+				]),
+			}),
+		});
+
+		const result = await runLoop({
+			sessionId: "storage-failure",
+			agent: { model: "mock/storage-failure" },
+			storage,
+			getModel: () => model,
+		});
+
+		expect(result.status).toBe("failed");
+		expect(result.error?.message).toContain("database unavailable");
+		expect((await base.load("storage-failure")).some((event) => event.type === "run-end")).toBe(
+			true,
+		);
+	});
+});
+
 describe("message queueing", () => {
 	it("mailbox refuses enqueues once the run commits to ending", () => {
 		const mailbox = createMailbox();

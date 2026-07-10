@@ -1,6 +1,6 @@
 {
 	"name": "@merkie/agentic",
-	"version": "0.4.0",
+	"version": "0.5.0",
 	"description": "A resilience, storage, and observability harness for LLM agents on the Vercel AI SDK + OpenRouter — durable resumable sessions, guaranteed-outcome tasks, smart retries, token-based compaction, and BYOK-aware cost tracking.",
 	"type": "module",
 	"license": "MIT",

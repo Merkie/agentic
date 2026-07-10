@@ -124,6 +124,7 @@ Everything the harness is built from is exported for use with plain
 ```bash
 npx tsx playground/boilerplate.ts          # the smallest useful setup — copy me
 npx tsx playground/mvp/demo-task.ts        # schema self-heal + guaranteed outcome
+npx tsx playground/mvp/demo-media-task.ts <image> # validated multimodal task
 npx tsx playground/mvp/demo-chaos.ts       # injected 500s + severed SSE mid-run
 npx tsx playground/mvp/demo-restart.ts     # SIGKILL mid-run → autoResume in new process
 npx tsx playground/mvp/demo-compaction.ts  # memory survives two compactions

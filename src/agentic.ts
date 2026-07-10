@@ -465,6 +465,13 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					});
 				}
 			}
+			if (prior.interruptedRunId) {
+				await storage.append(sessionId, {
+					type: "run-resume",
+					at: new Date().toISOString(),
+					runId: prior.interruptedRunId,
+				});
+			}
 
 			const result = await execRun<ToolSet>(sessionId, agent, {
 				abortSignal: taskOptions.abortSignal,
