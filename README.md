@@ -88,7 +88,7 @@ const outcome = await agentic.task({
   deliverable: z.object({ accountId: z.string(), balance: z.number() }),
 });
 // outcome.status: "submitted" (typed deliverable) | "cancelled" (model's
-// escape hatch, with reason) | "failed" (bounded retries exhausted)
+// escape hatch or an explicit abort, with reason) | "failed" (bounded retries exhausted)
 ```
 
 Every session — chats, workflows, one-shots — shares the same ledger, so all
@@ -134,6 +134,27 @@ empty/error step remains pending for recovery.
 that reconnects—or whose queued input is picked up by a different serialized
 run—should use the resolved `RunResult` and `session.messages()` as the source
 of truth; historical stream parts are not replayed from storage.
+
+Aborting a send's `abortSignal` is a durable, terminal cancellation. Agentic
+saves the current partial assistant step before `run-end`, returns its text in
+the cancelled `RunResult`, and includes it in `session.messages()`. Completed
+tool calls are paired with their real results when available, or with a
+synthetic interruption result, so the saved conversation remains safe to
+replay. A restart between the partial-step append and `run-end` reconciles the
+run as cancelled; it is never auto-resumed as unfinished work.
+
+Servers can also stop any run owned by the current Agentic runtime, including
+background auto-resume work, without retaining the caller's `AbortController`:
+
+```ts
+if (agentic.isRunning(sessionId)) {
+  agentic.cancel(sessionId, new Error("Stopped by user"));
+}
+```
+
+`cancel()` returns `true` only when it newly requests cancellation. This is an
+explicit whole-run stop; unlike an initiating request's disconnect signal, it
+is not suppressed when other callers have durably queued input into the run.
 
 When an automatic recovery reaches `maxAttempts`, queued-only work remains in
 the ledger and can still be retried with manual `resume()`; the cap prevents a

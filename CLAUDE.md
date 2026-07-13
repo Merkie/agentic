@@ -75,9 +75,11 @@ the message in. Key invariants, in `src/run.ts`:
   own run.
 - Replay tracks accepted queued inputs by queue id until a durable non-error
   step explicitly records that it saw them. An empty/error step does not
-  acknowledge input. A failed/cancelled `run-end` settles its ordinary
-  initiating input but preserves queued inputs it never saw, so
-  `resume()`/`interruptedSessions()` can recover them.
+  acknowledge input, except the explicit-cancellation marker, which
+  intentionally settles only the causal inputs recorded on that marker. A
+  failed/cancelled `run-end` settles its ordinary initiating input but
+  preserves queued inputs it never saw, so `resume()`/`interruptedSessions()`
+  can recover them.
 - The first durable non-error step that records a queue id counts as handling
   it, including a tool-call/result step. If that run later fails, every joined
   caller receives the persisted failure; the input is not automatically
@@ -86,6 +88,10 @@ the message in. Key invariants, in `src/run.ts`:
   `queue:false` call already waiting on the session lock can become the run
   that answers older queued input; those queued callers still receive the
   durable final result, but may not receive that run's historical deltas.
+- Every registered run owns a runtime `AbortController`, including the
+  pre-start registration window and auto-resume. `agentic.cancel(sessionId,
+  reason)` is the deliberate whole-run escape hatch and, unlike an initiating
+  caller's disconnect signal, is not suppressed by attached queued callers.
 
 ### Auto-resume (the boot sweep)
 

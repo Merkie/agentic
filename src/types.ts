@@ -82,6 +82,16 @@ export type StoredEvent =
 			acknowledgesInput?: boolean;
 			finishReason: string;
 			usage: StepUsage;
+			/**
+			 * Terminal intent captured with the step itself. Explicit cancellation
+			 * writes this before run-end so a crash in that two-append window is
+			 * reconciled as cancelled instead of being resumed or misreported as a
+			 * completed answer.
+			 */
+			interrupted?: {
+				status: "cancelled";
+				error: SerializedError;
+			};
 	  }
 	| {
 			type: "compaction";

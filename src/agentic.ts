@@ -177,6 +177,13 @@ export interface Agentic {
 	 * autoResume was not configured.
 	 */
 	resumeInterrupted(): Promise<RunResult[]>;
+	/** True while this runtime has an in-process run registered for the session. */
+	isRunning(sessionId: string): boolean;
+	/**
+	 * Explicitly cancel an in-process run, including an automatically resumed
+	 * run. Returns true only when this call newly requested cancellation.
+	 */
+	cancel(sessionId: string, reason?: unknown): boolean;
 	/** The underlying storage, for app-level queries. */
 	storage: StorageProvider;
 }
@@ -228,6 +235,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 	interface LiveRun {
 		mailbox: ReturnType<typeof createMailbox>;
 		result: Promise<RunResult>;
+		controller: AbortController;
 	}
 	const liveRuns = new Map<string, LiveRun>();
 
@@ -243,12 +251,11 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			>
 		>,
 		mailbox = createMailbox(),
+		controller = new AbortController(),
 	): Promise<RunResult> {
 		const initiatingSignal = runOptions.abortSignal;
-		let runAbortSignal = initiatingSignal;
 		let detachAbortListener: (() => void) | undefined;
 		if (initiatingSignal) {
-			const controller = new AbortController();
 			const forwardAbort = () => {
 				// Once another durable caller joins, the initiating HTTP/client
 				// disconnect no longer owns the shared run. Its queued work must finish.
@@ -261,7 +268,6 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				initiatingSignal.addEventListener("abort", forwardAbort, { once: true });
 				detachAbortListener = () => initiatingSignal.removeEventListener("abort", forwardAbort);
 			}
-			runAbortSignal = controller.signal;
 		}
 		const result = runLoop<TOOLS>({
 			sessionId,
@@ -271,9 +277,9 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			emit: emitEvent,
 			mailbox,
 			...runOptions,
-			abortSignal: runAbortSignal,
+			abortSignal: controller.signal,
 		});
-		liveRuns.set(sessionId, { mailbox, result });
+		liveRuns.set(sessionId, { mailbox, result, controller });
 		const cleanup = () => {
 			detachAbortListener?.();
 			if (liveRuns.get(sessionId)?.mailbox === mailbox) liveRuns.delete(sessionId);
@@ -291,31 +297,39 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		}
 	};
 
-	async function finalizePersistedAnswer<TOOLS extends ToolSet>(
+	async function finalizePersistedRun<TOOLS extends ToolSet>(
 		sessionId: string,
 		agent: AgentConfig<TOOLS>,
 		events: StoredEvent[],
 		replayed: ReplayedSession,
 	): Promise<RunResult | null> {
 		const runId = replayed.interruptedRunId;
-		if (!runId || replayed.pendingMessages > 0 || !finalizableStep(events, runId)) return null;
+		if (!runId) return null;
+		const interrupted = interruptedStepForRun(events, runId);
+		if (!interrupted && (replayed.pendingMessages > 0 || !finalizableStep(events, runId))) {
+			return null;
+		}
+		const status = interrupted?.interrupted?.status ?? "completed";
+		const error = interrupted?.interrupted?.error;
 
 		await storage.append(sessionId, {
 			type: "run-end",
 			at: new Date().toISOString(),
 			runId,
-			status: "completed",
+			status,
 			preservePending: true,
+			...(error ? { error } : {}),
 		});
 		const totals = {
 			...replayed.totals,
 			contextWindow: await getContextWindow(agent.model),
 		};
-		emitEvent({ type: "run-end", sessionId, runId, status: "completed", totals });
+		emitEvent({ type: "run-end", sessionId, runId, status, totals, ...(error ? { error } : {}) });
 		return {
-			status: "completed",
+			status,
 			text: lastAssistantTextForRun(events, runId),
 			totals,
+			...(error ? { error } : {}),
 		};
 	}
 
@@ -334,8 +348,16 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			}
 
 			return withSessionLock(id, async () => {
-				const events = await storage.load(id);
-				const replayed = replaySession(events);
+				let events = await storage.load(id);
+				let replayed = replaySession(events);
+				// A cancellation step is terminal even if its run-end append failed.
+				// Close it before deciding whether causally-later queued input needs
+				// a fresh recovery run.
+				const reconciled = await finalizePersistedRun(id, agent, events, replayed);
+				if (reconciled) {
+					events = await storage.load(id);
+					replayed = replaySession(events);
+				}
 				if (replayed.pendingQueueIds.includes(queueId)) {
 					// The prior run ended without any persisted model step whose input
 					// contained this accepted message. Re-drive it now; the session lock
@@ -388,6 +410,9 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						recoveryMailbox,
 					);
 				}
+				if (reconciled && queueAnsweredByRun(events, queueId) === live.mailbox.runId) {
+					return reconciled;
+				}
 
 				const answeredRunId = queueAnsweredByRun(events, queueId);
 				if (answeredRunId === null || answeredRunId === live.mailbox.runId) {
@@ -400,7 +425,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 							answeredRunId === live.mailbox.runId &&
 							replayed.interruptedRunId === answeredRunId
 						) {
-							const finalized = await finalizePersistedAnswer(id, agent, events, replayed);
+							const finalized = await finalizePersistedRun(id, agent, events, replayed);
 							if (finalized) return finalized;
 						}
 						throw liveFailure;
@@ -428,7 +453,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						// A crash/storage failure can leave the causally answering run open.
 						// Reconcile a clean final step, otherwise continue from its durable
 						// messages (not from the original run that missed this queue item).
-						const finalized = await finalizePersistedAnswer(id, agent, events, replayed);
+						const finalized = await finalizePersistedRun(id, agent, events, replayed);
 						if (finalized) return finalized;
 						return execRun<TOOLS>(id, agent, {
 							abortSignal: sendOptions.abortSignal,
@@ -488,6 +513,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					// call yields. A same-tick second send now sees the placeholder mailbox
 					// and takes the durable queue path instead of living only in a lock.
 					const mailbox = createMailbox();
+					const controller = new AbortController();
 					let resolveLive!: (result: RunResult) => void;
 					let rejectLive!: (error: unknown) => void;
 					const liveResult = new Promise<RunResult>((resolve, reject) => {
@@ -495,7 +521,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						rejectLive = reject;
 					});
 					void liveResult.catch(() => {});
-					liveRuns.set(id, { mailbox, result: liveResult });
+					liveRuns.set(id, { mailbox, result: liveResult, controller });
 					const inputId = newId();
 					const initialAppend = Promise.resolve(
 						storage.append(id, {
@@ -514,7 +540,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						);
 						const priorEvents = inputIndex >= 0 ? events.slice(0, inputIndex) : events;
 						const prior = replaySession(priorEvents);
-						const finalized = await finalizePersistedAnswer(id, agent, priorEvents, prior);
+						const finalized = await finalizePersistedRun(id, agent, priorEvents, prior);
 						if (prior.interruptedRunId && !finalized) {
 							await storage.append(id, {
 								type: "run-resume",
@@ -532,6 +558,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 									prior.interruptedRunId && !finalized ? prior.interruptedRunId : undefined,
 							},
 							mailbox,
+							controller,
 						);
 					});
 					result.then(resolveLive, rejectLive);
@@ -548,7 +575,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				return withSessionLock(id, async () => {
 					const priorEvents = await storage.load(id);
 					const prior = replaySession(priorEvents);
-					const finalized = await finalizePersistedAnswer(id, agent, priorEvents, prior);
+					const finalized = await finalizePersistedRun(id, agent, priorEvents, prior);
 					await storage.append(id, {
 						type: "user-message",
 						at: new Date().toISOString(),
@@ -571,11 +598,15 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			},
 			resume(resumeOptions = {}) {
 				return withSessionLock(id, async () => {
-					const events = await storage.load(id);
-					const replayed = replaySession(events);
+					let events = await storage.load(id);
+					let replayed = replaySession(events);
 					if (!replayed.interruptedRunId && replayed.pendingMessages === 0) return null;
-					const finalized = await finalizePersistedAnswer(id, agent, events, replayed);
-					if (finalized) return finalized;
+					const finalized = await finalizePersistedRun(id, agent, events, replayed);
+					if (finalized) {
+						if (replayed.pendingMessages === 0) return finalized;
+						events = await storage.load(id);
+						replayed = replaySession(events);
+					}
 					await storage.append(id, {
 						type: "run-resume",
 						at: new Date().toISOString(),
@@ -708,7 +739,8 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		return withSessionLock(sessionId, async () => {
 			// A resumed task may already be settled in its persisted history
 			// (process died between the terminal tool running and run-end).
-			const prior = replaySession(await storage.load(sessionId));
+			const priorEvents = await storage.load(sessionId);
+			const prior = replaySession(priorEvents);
 			const priorOutcome = findSettledOutcome<T>(prior.messages, schema, sessionId);
 			if (priorOutcome) {
 				if (prior.interruptedRunId) {
@@ -732,6 +764,26 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					});
 				}
 				return { ...priorOutcome, totals: prior.totals };
+			}
+			const savedCancellation = latestExplicitCancellation(priorEvents);
+			if (savedCancellation && savedCancellation.runId !== prior.interruptedRunId) {
+				return {
+					status: "cancelled",
+					reason: savedCancellation.error.message,
+					totals: prior.totals,
+					sessionId,
+				};
+			}
+			if (prior.interruptedRunId && interruptedStepForRun(priorEvents, prior.interruptedRunId)) {
+				const finalized = await finalizePersistedRun(sessionId, agent, priorEvents, prior);
+				if (finalized?.status === "cancelled") {
+					return {
+						status: "cancelled",
+						reason: finalized.error?.message ?? "Cancelled",
+						totals: finalized.totals,
+						sessionId,
+					};
+				}
 			}
 
 			if (prior.messages.length === 0) {
@@ -766,6 +818,14 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			if (settled) {
 				const outcome = settled as TaskOutcome<T>;
 				return { ...outcome, totals: result.totals };
+			}
+			if (result.status === "cancelled") {
+				return {
+					status: "cancelled",
+					reason: result.error?.message ?? "Cancelled",
+					totals: result.totals,
+					sessionId,
+				};
 			}
 			return {
 				status: "failed",
@@ -872,11 +932,15 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			const kick = withSessionLock(id, async () => {
 				// Re-check under the lock — a send() may have raced the sweep.
 				if (liveRuns.has(id)) return null;
-				const events = await storage.load(id);
-				const current = replaySession(events);
+				let events = await storage.load(id);
+				let current = replaySession(events);
 				if (!current.interruptedRunId && current.pendingMessages === 0) return null;
-				const finalized = await finalizePersistedAnswer(id, resolvedAgent, events, current);
-				if (finalized) return finalized;
+				const finalized = await finalizePersistedRun(id, resolvedAgent, events, current);
+				if (finalized) {
+					if (current.pendingMessages === 0) return finalized;
+					events = await storage.load(id);
+					current = replaySession(events);
+				}
 				await storage.append(id, {
 					type: "run-resume",
 					at: new Date().toISOString(),
@@ -919,6 +983,15 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		},
 		interruptedSessions,
 		resumeInterrupted,
+		isRunning(sessionId) {
+			return liveRuns.has(sessionId);
+		},
+		cancel(sessionId, reason) {
+			const live = liveRuns.get(sessionId);
+			if (!live || live.controller.signal.aborted) return false;
+			live.controller.abort(reason ?? new Error("Cancelled"));
+			return true;
+		},
 		storage,
 	};
 }
@@ -966,7 +1039,40 @@ function finalizableStep(
 	for (const event of events) {
 		if (event.type === "step" && event.runId === runId) last = event;
 	}
-	return last && last.finishReason !== "tool-calls" && last.finishReason !== "error" ? last : null;
+	return last &&
+		!last.interrupted &&
+		last.finishReason !== "tool-calls" &&
+		last.finishReason !== "error" &&
+		last.finishReason !== "cancelled"
+		? last
+		: null;
+}
+
+function interruptedStepForRun(
+	events: StoredEvent[],
+	runId: string,
+): Extract<StoredEvent, { type: "step" }> | null {
+	let last: Extract<StoredEvent, { type: "step" }> | null = null;
+	for (const event of events) {
+		if (event.type === "step" && event.runId === runId) last = event;
+	}
+	return last?.interrupted ? last : null;
+}
+
+function latestExplicitCancellation(events: StoredEvent[]): {
+	runId: string;
+	error: NonNullable<Extract<StoredEvent, { type: "step" }>["interrupted"]>["error"];
+} | null {
+	let runId: string | null = null;
+	for (const event of events) {
+		if (event.type === "run-start") runId = event.runId;
+	}
+	if (!runId) return null;
+	const interrupted = interruptedStepForRun(events, runId)?.interrupted;
+	if (!interrupted) return null;
+	const terminal = terminalEventForRun(events, runId);
+	if (terminal && terminal.status !== "cancelled") return null;
+	return { runId, error: interrupted.error };
 }
 
 function lastAssistantText(messages: ModelMessage[]): string {

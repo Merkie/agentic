@@ -816,6 +816,724 @@ describe("ledger durability", () => {
 	});
 });
 
+describe("explicit cancellation durability", () => {
+	const hangingTextStream = (
+		abortSignal: AbortSignal | undefined,
+		text?: string,
+		onStarted?: () => void,
+	) =>
+		new ReadableStream<LanguageModelV3StreamPart>({
+			start(controller) {
+				const abort = () => controller.error(abortSignal?.reason ?? new Error("aborted"));
+				abortSignal?.addEventListener("abort", abort, { once: true });
+				controller.enqueue({ type: "stream-start", warnings: [] });
+				if (text !== undefined) {
+					controller.enqueue({ type: "text-start", id: "partial" });
+					controller.enqueue({ type: "text-delta", id: "partial", delta: text });
+				}
+				onStarted?.();
+			},
+		});
+
+	it("durably closes a send whose signal was already aborted", async () => {
+		const modelId = "mock/cancel-pre-aborted";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const abort = new AbortController();
+		abort.abort(new Error("already stopped"));
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model must not run");
+			},
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"cancel-pre-aborted",
+			{ model: modelId },
+		);
+
+		await expect(session.send("hello", { abortSignal: abort.signal })).resolves.toMatchObject({
+			status: "cancelled",
+			text: "",
+			error: { message: "already stopped" },
+		});
+		expect(calls).toBe(0);
+		const events = await storage.load("cancel-pre-aborted");
+		expect(events.map((event) => event.type)).toEqual([
+			"user-message",
+			"run-start",
+			"step",
+			"run-end",
+		]);
+		expect(events.at(-2)).toMatchObject({
+			type: "step",
+			finishReason: "cancelled",
+			interrupted: { status: "cancelled" },
+		});
+		expect(replaySession(events).pendingMessages).toBe(0);
+	});
+
+	it("persists and returns assistant text when aborted after the first delta", async () => {
+		const modelId = "mock/cancel-after-delta";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const abort = new AbortController();
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => ({
+				stream: hangingTextStream(abortSignal, "kept partial answer"),
+			}),
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"cancel-after-delta",
+			{ model: modelId },
+		);
+
+		const result = await session.send("hello", {
+			abortSignal: abort.signal,
+			onPart: (part) => {
+				if (part.type === "text-delta") abort.abort(new Error("user pressed stop"));
+			},
+		});
+
+		expect(result).toMatchObject({
+			status: "cancelled",
+			text: "kept partial answer",
+			error: { message: "user pressed stop" },
+		});
+		const events = await storage.load("cancel-after-delta");
+		const step = events.find(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(step).toMatchObject({
+			finishReason: "cancelled",
+			acknowledgesInput: true,
+			interrupted: { status: "cancelled", error: { message: "user pressed stop" } },
+		});
+		expect(JSON.stringify(step?.messages)).toContain("kept partial answer");
+		expect(events.at(-1)).toMatchObject({ type: "run-end", status: "cancelled" });
+		expect(JSON.stringify(await session.messages())).toContain("kept partial answer");
+		expect(replaySession(events).pendingMessages).toBe(0);
+	});
+
+	it("records terminal cancellation even when stopped before the first token", async () => {
+		const modelId = "mock/cancel-before-token";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const abort = new AbortController();
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => ({
+				stream: hangingTextStream(abortSignal, undefined, markStarted),
+			}),
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"cancel-before-token",
+			{ model: modelId },
+		);
+
+		const pending = session.send("hello", { abortSignal: abort.signal });
+		await started;
+		abort.abort(new Error("stopped before output"));
+		await expect(pending).resolves.toMatchObject({ status: "cancelled", text: "" });
+
+		const events = await storage.load("cancel-before-token");
+		const step = events.find(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(step).toMatchObject({
+			messages: [],
+			finishReason: "cancelled",
+			acknowledgesInput: true,
+			interrupted: { status: "cancelled" },
+		});
+		expect(replaySession(events)).toMatchObject({
+			interruptedRunId: null,
+			pendingMessages: 0,
+		});
+	});
+
+	it("does not acknowledge queued input when cancellation lands before streamText", async () => {
+		const modelId = "mock/cancel-before-stream-text";
+		setContextWindow(modelId, 100_000);
+		const base = memoryStorage();
+		const sessionId = "cancel-before-stream-text";
+		await base.append(sessionId, {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "queued work" },
+			meta: { queued: true, queueId: "q-before-stream" },
+		});
+		let releaseRunStart!: () => void;
+		const runStartGate = new Promise<void>((resolve) => {
+			releaseRunStart = resolve;
+		});
+		let markRunStart!: () => void;
+		const runStartSeen = new Promise<void>((resolve) => {
+			markRunStart = resolve;
+		});
+		const storage = {
+			...base,
+			append: async (id: string, event: StoredEvent) => {
+				if (event.type === "run-start") {
+					markRunStart();
+					await runStartGate;
+				}
+				await base.append(id, event);
+			},
+		};
+		const abort = new AbortController();
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model must not run");
+			},
+		});
+		const pending = runLoop({
+			sessionId,
+			agent: { model: modelId },
+			storage,
+			getModel: () => model,
+			abortSignal: abort.signal,
+		});
+
+		await runStartSeen;
+		abort.abort(new Error("stop before model entry"));
+		releaseRunStart();
+		await expect(pending).resolves.toMatchObject({ status: "cancelled" });
+
+		const events = await base.load(sessionId);
+		const cancellation = events.find(
+			(event): event is Extract<StoredEvent, { type: "step" }> =>
+				event.type === "step" && event.interrupted !== undefined,
+		);
+		expect(cancellation?.inputQueueIds).toEqual([]);
+		expect(replaySession(events).pendingQueueIds).toEqual(["q-before-stream"]);
+		expect(calls).toBe(0);
+	});
+
+	it("keeps a completed tool step and salvages only the partial current step", async () => {
+		const modelId = "mock/cancel-after-completed-step";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const abort = new AbortController();
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => {
+				calls += 1;
+				if (calls === 1) {
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{
+								type: "tool-call",
+								toolCallId: "lookup-complete",
+								toolName: "lookup",
+								input: JSON.stringify({ query: "answer" }),
+							},
+							{
+								type: "finish",
+								finishReason: { unified: "tool-calls", raw: "tool_calls" },
+								usage: {
+									inputTokens: {
+										total: 10,
+										noCache: 10,
+										cacheRead: undefined,
+										cacheWrite: undefined,
+									},
+									outputTokens: { total: 5, text: 0, reasoning: undefined },
+								},
+							},
+						]),
+					};
+				}
+				return { stream: hangingTextStream(abortSignal, "partial continuation") };
+			},
+		});
+		const lookup = tool({
+			inputSchema: z.object({ query: z.string() }),
+			execute: async () => ({ value: 42 }),
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"cancel-after-completed-step",
+			{ model: modelId, tools: { lookup } },
+		);
+
+		const result = await session.send("look it up", {
+			abortSignal: abort.signal,
+			onPart: (part) => {
+				if (part.type === "text-delta") abort.abort(new Error("stop continuation"));
+			},
+		});
+
+		expect(result).toMatchObject({ status: "cancelled", text: "partial continuation" });
+		const steps = (await storage.load("cancel-after-completed-step")).filter(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(steps).toHaveLength(2);
+		expect(steps[0]).toMatchObject({ finishReason: "tool-calls" });
+		expect(steps[0].interrupted).toBeUndefined();
+		expect(steps[1]).toMatchObject({
+			finishReason: "cancelled",
+			interrupted: { status: "cancelled" },
+		});
+		expect(JSON.stringify(steps[1].messages)).toContain("partial continuation");
+		expect(JSON.stringify(steps[1].messages)).not.toContain("lookup-complete");
+	});
+
+	it("pairs an interrupted tool call with a synthetic replay-safe result", async () => {
+		const modelId = "mock/cancel-tool-call";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const abort = new AbortController();
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => ({
+				stream: new ReadableStream<LanguageModelV3StreamPart>({
+					start(controller) {
+						abortSignal?.addEventListener(
+							"abort",
+							() => controller.error(abortSignal.reason ?? new Error("aborted")),
+							{ once: true },
+						);
+						controller.enqueue({ type: "stream-start", warnings: [] });
+						controller.enqueue({
+							type: "tool-call",
+							toolCallId: "lookup-interrupted",
+							toolName: "lookup",
+							input: JSON.stringify({ query: "weather" }),
+						});
+					},
+				}),
+			}),
+		});
+		const lookup = tool({ inputSchema: z.object({ query: z.string() }) });
+		const session = createAgentic({ storage, getModel: () => model }).session("cancel-tool-call", {
+			model: modelId,
+			tools: { lookup },
+		});
+
+		await expect(
+			session.send("check", {
+				abortSignal: abort.signal,
+				onPart: (part) => {
+					if (part.type === "tool-call") abort.abort(new Error("stop before execution"));
+				},
+			}),
+		).resolves.toMatchObject({ status: "cancelled" });
+
+		const events = await storage.load("cancel-tool-call");
+		const step = events.find(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(step?.messages.map((message) => message.role)).toEqual(["assistant", "tool"]);
+		expect(JSON.stringify(step?.messages)).toContain("lookup-interrupted");
+		expect(JSON.stringify(step?.messages)).toContain("run was cancelled");
+		const replayed = replaySession(events);
+		expect(replayed.repaired).toBe(0);
+		expect(replayed.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"]);
+	});
+
+	it("does not promote a preliminary tool result to a final result on cancellation", async () => {
+		const modelId = "mock/cancel-preliminary-tool-result";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const abort = new AbortController();
+		const model = new MockLanguageModelV3({
+			doStream: async () => ({
+				stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+					{ type: "stream-start", warnings: [] },
+					{
+						type: "tool-call",
+						toolCallId: "streaming-tool",
+						toolName: "streaming_lookup",
+						input: JSON.stringify({ query: "weather" }),
+					},
+					{
+						type: "finish",
+						finishReason: { unified: "tool-calls", raw: "tool_calls" },
+						usage: {
+							inputTokens: {
+								total: 10,
+								noCache: 10,
+								cacheRead: undefined,
+								cacheWrite: undefined,
+							},
+							outputTokens: { total: 1, text: 0, reasoning: undefined },
+						},
+					},
+				]),
+			}),
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"cancel-preliminary-tool-result",
+			{
+				model: modelId,
+				tools: {
+					streaming_lookup: tool({
+						inputSchema: z.object({ query: z.string() }),
+						execute: async function* (_input, { abortSignal }) {
+							yield { stage: "preview-only" };
+							await new Promise<never>((_resolve, reject) => {
+								const stop = () => reject(abortSignal?.reason ?? new Error("aborted"));
+								if (abortSignal?.aborted) stop();
+								else abortSignal?.addEventListener("abort", stop, { once: true });
+							});
+						},
+					}),
+				},
+			},
+		);
+
+		await expect(
+			session.send("check", {
+				abortSignal: abort.signal,
+				onPart: (part) => {
+					if (part.type === "tool-result" && part.preliminary) {
+						abort.abort(new Error("stop during preview"));
+					}
+				},
+			}),
+		).resolves.toMatchObject({ status: "cancelled" });
+
+		const events = await storage.load("cancel-preliminary-tool-result");
+		const saved = JSON.stringify(events);
+		expect(saved).not.toContain("preview-only");
+		expect(saved).toContain("run was cancelled");
+		expect(replaySession(events).repaired).toBe(0);
+	});
+
+	it("force-cancels a live run through the public runtime API", async () => {
+		const modelId = "mock/runtime-cancel-live";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		let markDelta!: () => void;
+		const deltaSeen = new Promise<void>((resolve) => {
+			markDelta = resolve;
+		});
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => ({
+				stream: hangingTextStream(abortSignal, "kept through runtime cancel"),
+			}),
+		});
+		const agentic = createAgentic({ storage, getModel: () => model });
+		const session = agentic.session("runtime-cancel-live", { model: modelId });
+
+		const pending = session.send("hello", {
+			onPart: (part) => {
+				if (part.type === "text-delta") markDelta();
+			},
+		});
+		await deltaSeen;
+		expect(agentic.isRunning("runtime-cancel-live")).toBe(true);
+		expect(agentic.cancel("runtime-cancel-live", new Error("server stop"))).toBe(true);
+		expect(agentic.cancel("runtime-cancel-live", new Error("duplicate stop"))).toBe(false);
+		await expect(pending).resolves.toMatchObject({
+			status: "cancelled",
+			text: "kept through runtime cancel",
+			error: { message: "server stop" },
+		});
+		expect(agentic.isRunning("runtime-cancel-live")).toBe(false);
+	});
+
+	it("can cancel the registered run before its initial durable append settles", async () => {
+		const modelId = "mock/runtime-cancel-before-start";
+		setContextWindow(modelId, 100_000);
+		const base = memoryStorage();
+		let releaseAppend!: () => void;
+		const appendGate = new Promise<void>((resolve) => {
+			releaseAppend = resolve;
+		});
+		let markAppendStarted!: () => void;
+		const appendStarted = new Promise<void>((resolve) => {
+			markAppendStarted = resolve;
+		});
+		let blockInput = true;
+		const storage = {
+			...base,
+			append: async (sessionId: string, event: StoredEvent) => {
+				if (blockInput && event.type === "user-message") {
+					blockInput = false;
+					markAppendStarted();
+					await appendGate;
+				}
+				await base.append(sessionId, event);
+			},
+		};
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model must not run");
+			},
+		});
+		const agentic = createAgentic({ storage, getModel: () => model });
+		const pending = agentic
+			.session("runtime-cancel-before-start", { model: modelId })
+			.send("hello");
+
+		await appendStarted;
+		expect(agentic.isRunning("runtime-cancel-before-start")).toBe(true);
+		expect(agentic.cancel("runtime-cancel-before-start", new Error("early stop"))).toBe(true);
+		releaseAppend();
+		await expect(pending).resolves.toMatchObject({
+			status: "cancelled",
+			error: { message: "early stop" },
+		});
+		expect(calls).toBe(0);
+		expect(agentic.isRunning("runtime-cancel-before-start")).toBe(false);
+	});
+
+	it("reconciles a saved cancellation marker without another model call", async () => {
+		const modelId = "mock/cancel-run-end-crash";
+		setContextWindow(modelId, 100_000);
+		const base = memoryStorage();
+		let rejectCancelledEnd = true;
+		const flakyStorage = {
+			...base,
+			append: async (sessionId: string, event: StoredEvent) => {
+				if (event.type === "run-end" && event.status === "cancelled" && rejectCancelledEnd) {
+					rejectCancelledEnd = false;
+					throw new Error("run-end unavailable");
+				}
+				await base.append(sessionId, event);
+			},
+		};
+		const abort = new AbortController();
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => {
+				calls += 1;
+				return { stream: hangingTextStream(abortSignal, "durable before crash") };
+			},
+		});
+		const first = createAgentic({ storage: flakyStorage, getModel: () => model }).session(
+			"cancel-run-end-crash",
+			{ model: modelId },
+		);
+
+		await expect(
+			first.send("hello", {
+				abortSignal: abort.signal,
+				onPart: (part) => {
+					if (part.type === "text-delta") abort.abort(new Error("intentional stop"));
+				},
+			}),
+		).rejects.toThrow("run-end unavailable");
+		const crashed = replaySession(await base.load("cancel-run-end-crash"));
+		expect(crashed.interruptedRunId).not.toBeNull();
+		expect(JSON.stringify(crashed.messages)).toContain("durable before crash");
+
+		const recovered = createAgentic({ storage: base, getModel: () => model }).session(
+			"cancel-run-end-crash",
+			{ model: modelId },
+		);
+		await expect(recovered.resume()).resolves.toMatchObject({
+			status: "cancelled",
+			text: "durable before crash",
+			error: { message: "intentional stop" },
+		});
+		expect(calls).toBe(1);
+		expect((await base.load("cancel-run-end-crash")).at(-1)).toMatchObject({
+			type: "run-end",
+			status: "cancelled",
+		});
+		expect(await recovered.isInterrupted()).toBe(false);
+	});
+
+	it("auto-resume finalizes cancellation instead of re-entering the model", async () => {
+		const modelId = "mock/cancel-auto-resume";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		await storage.append("cancel-auto-resume", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "hello" },
+		});
+		await storage.append("cancel-auto-resume", {
+			type: "run-start",
+			at: "t1",
+			runId: "cancelled-run",
+			model: modelId,
+		});
+		await storage.append("cancel-auto-resume", {
+			type: "step",
+			at: "t2",
+			runId: "cancelled-run",
+			messages: [{ role: "assistant", content: "kept" }],
+			inputQueueIds: [],
+			acknowledgesInput: true,
+			finishReason: "cancelled",
+			usage: usage({
+				inputTokens: null,
+				outputTokens: null,
+				totalTokens: null,
+				cost: null,
+				billedCost: null,
+			}),
+			interrupted: {
+				status: "cancelled",
+				error: { message: "stopped" },
+			},
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model must not run");
+			},
+		});
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+			autoResume: () => ({ model: modelId }),
+		});
+
+		await agentic.resumeInterrupted();
+		expect(calls).toBe(0);
+		const events = await storage.load("cancel-auto-resume");
+		expect(events.filter((event) => event.type === "run-resume")).toHaveLength(0);
+		expect(events.filter((event) => event.type === "run-end")).toEqual([
+			expect.objectContaining({ runId: "cancelled-run", status: "cancelled" }),
+		]);
+		expect(await agentic.interruptedSessions()).toEqual([]);
+	});
+
+	it("a resumed task reports a saved explicit cancellation without model work", async () => {
+		const modelId = "mock/cancel-resumed-task";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		await storage.append("cancel-resumed-task", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "do work" },
+		});
+		await storage.append("cancel-resumed-task", {
+			type: "run-start",
+			at: "t1",
+			runId: "cancelled-task-run",
+			model: modelId,
+		});
+		await storage.append("cancel-resumed-task", {
+			type: "step",
+			at: "t2",
+			runId: "cancelled-task-run",
+			messages: [{ role: "assistant", content: "partial task work" }],
+			inputQueueIds: [],
+			acknowledgesInput: true,
+			finishReason: "cancelled",
+			usage: usage(),
+			interrupted: { status: "cancelled", error: { message: "operator stopped task" } },
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				throw new Error("model must not run");
+			},
+		});
+		const agentic = createAgentic({ storage, getModel: () => model });
+
+		await expect(
+			agentic.task({
+				id: "cancel-resumed-task",
+				agent: { model: modelId },
+				prompt: "must not be appended",
+			}),
+		).resolves.toMatchObject({
+			status: "cancelled",
+			reason: "operator stopped task",
+		});
+		expect(calls).toBe(0);
+		expect((await storage.load("cancel-resumed-task")).at(-1)).toMatchObject({
+			type: "run-end",
+			status: "cancelled",
+		});
+	});
+
+	it("replays a normally closed explicit task cancellation without model work", async () => {
+		const modelId = "mock/cancel-closed-task";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		const abort = new AbortController();
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => {
+				calls += 1;
+				return { stream: hangingTextStream(abortSignal, "partial task work") };
+			},
+		});
+		const agentic = createAgentic({ storage, getModel: () => model });
+		const options = {
+			id: "cancel-closed-task",
+			agent: { model: modelId },
+			prompt: "do work",
+		};
+
+		await expect(
+			agentic.task({
+				...options,
+				abortSignal: abort.signal,
+				onPart: (part) => {
+					if (part.type === "text-delta") abort.abort(new Error("operator stopped task"));
+				},
+			}),
+		).resolves.toMatchObject({ status: "cancelled", reason: "operator stopped task" });
+		expect(replaySession(await storage.load(options.id)).interruptedRunId).toBeNull();
+
+		await expect(agentic.task(options)).resolves.toMatchObject({
+			status: "cancelled",
+			reason: "operator stopped task",
+		});
+		expect(calls).toBe(1);
+	});
+
+	it("fails terminally when the cancellation step cannot be persisted", async () => {
+		const modelId = "mock/cancel-step-storage-failure";
+		setContextWindow(modelId, 100_000);
+		const base = memoryStorage();
+		const storage = {
+			...base,
+			append: async (sessionId: string, event: StoredEvent) => {
+				if (event.type === "step" && event.interrupted) {
+					throw new Error("cannot save partial response");
+				}
+				await base.append(sessionId, event);
+			},
+		};
+		const abort = new AbortController();
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => ({
+				stream: hangingTextStream(abortSignal, "not durable"),
+			}),
+		});
+		const session = createAgentic({ storage, getModel: () => model }).session(
+			"cancel-step-storage-failure",
+			{ model: modelId },
+		);
+
+		await expect(
+			session.send("hello", {
+				abortSignal: abort.signal,
+				onPart: (part) => {
+					if (part.type === "text-delta") abort.abort(new Error("stop"));
+				},
+			}),
+		).resolves.toMatchObject({
+			status: "failed",
+			text: "not durable",
+			error: { message: "cannot save partial response" },
+		});
+		const events = await base.load("cancel-step-storage-failure");
+		expect(events.some((event) => event.type === "step" && event.interrupted)).toBe(false);
+		expect(events.at(-1)).toMatchObject({ type: "run-end", status: "failed" });
+		expect(replaySession(events).interruptedRunId).toBeNull();
+	});
+});
+
 describe("compaction with pending inputs", () => {
 	const generatedSummary = {
 		content: [{ type: "text" as const, text: "summary of earlier history" }],
@@ -973,6 +1691,86 @@ describe("compaction with pending inputs", () => {
 				JSON.stringify(message.content).includes("current forced question"),
 			),
 		).toHaveLength(1);
+	});
+
+	it("does not acknowledge queued input when cancelled during pre-pass compaction", async () => {
+		const modelId = "mock/compact-cancel-before-pass";
+		setContextWindow(modelId, 100);
+		const storage = memoryStorage();
+		const sessionId = "compact-cancel-before-pass";
+		await storage.append(sessionId, {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "old question" },
+		});
+		await storage.append(sessionId, {
+			type: "step",
+			at: "t1",
+			runId: "old",
+			messages: [{ role: "assistant", content: "old answer" }],
+			inputQueueIds: [],
+			finishReason: "stop",
+			usage: usage({ inputTokens: 60, outputTokens: 20, totalTokens: 80 }),
+		});
+		await storage.append(sessionId, {
+			type: "run-end",
+			at: "t2",
+			runId: "old",
+			status: "completed",
+		});
+		await storage.append(sessionId, {
+			type: "user-message",
+			at: "t3",
+			message: { role: "user", content: "queued question" },
+			meta: { queued: true, queueId: "q-cancelled-compaction" },
+		});
+		const abort = new AbortController();
+		let markCompactionStarted!: () => void;
+		const compactionStarted = new Promise<void>((resolve) => {
+			markCompactionStarted = resolve;
+		});
+		let streamCalls = 0;
+		const model = new MockLanguageModelV3({
+			doGenerate: async ({ abortSignal }) => {
+				markCompactionStarted();
+				return new Promise<never>((_resolve, reject) => {
+					const stop = () => reject(abortSignal?.reason ?? new Error("aborted"));
+					if (abortSignal?.aborted) stop();
+					else abortSignal?.addEventListener("abort", stop, { once: true });
+				});
+			},
+			doStream: async () => {
+				streamCalls += 1;
+				return { stream: answerStream() };
+			},
+		});
+
+		const pending = runLoop({
+			sessionId,
+			agent: { model: modelId, compaction: { limit: 0.5, keepRecent: 0 } },
+			storage,
+			getModel: () => model,
+			abortSignal: abort.signal,
+		});
+		await compactionStarted;
+		abort.abort(new Error("stop during compaction"));
+		await expect(pending).resolves.toMatchObject({
+			status: "cancelled",
+			error: { message: "stop during compaction" },
+		});
+
+		const events = await storage.load(sessionId);
+		const cancellation = events.find(
+			(event): event is Extract<StoredEvent, { type: "step" }> =>
+				event.type === "step" && event.interrupted !== undefined,
+		);
+		expect(cancellation).toMatchObject({
+			inputQueueIds: [],
+			acknowledgesInput: true,
+			messages: [],
+		});
+		expect(streamCalls).toBe(0);
+		expect(replaySession(events).pendingQueueIds).toEqual(["q-cancelled-compaction"]);
 	});
 });
 
@@ -2404,6 +3202,66 @@ describe("auto-resume", () => {
 		]);
 		expect(eventTypes).toContain("auto-resume");
 		expect(await agentic.interruptedSessions()).toEqual([]);
+	});
+
+	it("public cancellation stops an in-process auto-resumed run", async () => {
+		const modelId = "mock/cancel-auto-resumed-live";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		await storage.append("cancel-auto-resumed-live", {
+			type: "user-message",
+			at: "t0",
+			message: { role: "user", content: "continue after restart" },
+		});
+		await storage.append("cancel-auto-resumed-live", {
+			type: "run-start",
+			at: "t1",
+			runId: "crashed-run",
+			model: modelId,
+		});
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => ({
+				stream: new ReadableStream<LanguageModelV3StreamPart>({
+					start(controller) {
+						const stop = () => controller.error(abortSignal?.reason ?? new Error("aborted"));
+						abortSignal?.addEventListener("abort", stop, { once: true });
+						controller.enqueue({ type: "stream-start", warnings: [] });
+						controller.enqueue({ type: "text-start", id: "partial" });
+						controller.enqueue({
+							type: "text-delta",
+							id: "partial",
+							delta: "auto-resumed partial",
+						});
+						markStarted();
+					},
+				}),
+			}),
+		});
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+			autoResume: (sessionId) =>
+				sessionId === "cancel-auto-resumed-live" ? { model: modelId } : null,
+		});
+
+		await started;
+		expect(agentic.isRunning("cancel-auto-resumed-live")).toBe(true);
+		expect(agentic.cancel("cancel-auto-resumed-live", new Error("stop recovered generation"))).toBe(
+			true,
+		);
+		await waitUntil(() => !agentic.isRunning("cancel-auto-resumed-live"));
+
+		const events = await storage.load("cancel-auto-resumed-live");
+		expect(events.at(-1)).toMatchObject({
+			type: "run-end",
+			runId: "crashed-run",
+			status: "cancelled",
+			error: { message: "stop recovered generation" },
+		});
 	});
 
 	it("manual sweep resumes an orphaned queued message and returns the result", async () => {

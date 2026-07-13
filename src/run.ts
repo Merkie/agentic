@@ -4,6 +4,8 @@ import {
 	stepCountIs,
 	streamText,
 	type TextStreamPart,
+	type ToolCallPart,
+	type ToolResultPart,
 	type ToolSet,
 } from "ai";
 import { resolveRetryConfig, retryDelayMs, wait } from "./backoff.js";
@@ -186,6 +188,204 @@ function stripProviderOptions(messages: ModelMessage[]): ModelMessage[] {
 	});
 }
 
+type CapturedToolCall = Pick<
+	ToolCallPart,
+	"type" | "toolCallId" | "toolName" | "input" | "providerExecuted" | "providerOptions"
+>;
+
+type CapturedToolResult = {
+	toolCallId: string;
+	toolName: string;
+	input: unknown;
+	kind: "result" | "error" | "denied";
+	value?: unknown;
+};
+
+interface PartialStepCapture {
+	text: string;
+	toolCalls: CapturedToolCall[];
+	toolResults: Map<string, CapturedToolResult>;
+}
+
+function emptyPartialStepCapture(): PartialStepCapture {
+	return { text: "", toolCalls: [], toolResults: new Map() };
+}
+
+function resetPartialStepCapture(capture: PartialStepCapture): void {
+	capture.text = "";
+	capture.toolCalls = [];
+	capture.toolResults.clear();
+}
+
+function captureStreamPart<TOOLS extends ToolSet>(
+	capture: PartialStepCapture,
+	part: TextStreamPart<TOOLS>,
+): void {
+	switch (part.type) {
+		case "start-step":
+		case "finish-step":
+			resetPartialStepCapture(capture);
+			break;
+		case "text-delta":
+			capture.text += part.text;
+			break;
+		case "tool-call":
+			if (!capture.toolCalls.some((call) => call.toolCallId === part.toolCallId)) {
+				capture.toolCalls.push({
+					type: "tool-call",
+					toolCallId: part.toolCallId,
+					toolName: part.toolName,
+					input: part.input,
+					...(part.providerExecuted === undefined
+						? {}
+						: { providerExecuted: part.providerExecuted }),
+					...(part.providerMetadata === undefined
+						? {}
+						: { providerOptions: part.providerMetadata }),
+				});
+			}
+			break;
+		case "tool-result":
+			// AI SDK tools can emit replaceable previews before their authoritative
+			// result. If cancellation lands between the two, treating the preview as
+			// final would make replay claim interrupted work completed successfully.
+			if (part.preliminary === true) break;
+			capture.toolResults.set(part.toolCallId, {
+				toolCallId: part.toolCallId,
+				toolName: part.toolName,
+				input: part.input,
+				kind: "result",
+				value: part.output,
+			});
+			break;
+		case "tool-error":
+			capture.toolResults.set(part.toolCallId, {
+				toolCallId: part.toolCallId,
+				toolName: part.toolName,
+				input: part.input,
+				kind: "error",
+				value: part.error,
+			});
+			break;
+		case "tool-output-denied": {
+			const call = capture.toolCalls.find((candidate) => candidate.toolCallId === part.toolCallId);
+			capture.toolResults.set(part.toolCallId, {
+				toolCallId: part.toolCallId,
+				toolName: part.toolName,
+				input: call?.input,
+				kind: "denied",
+			});
+			break;
+		}
+		case "tool-approval-request":
+			if (!capture.toolCalls.some((call) => call.toolCallId === part.toolCall.toolCallId)) {
+				capture.toolCalls.push({
+					type: "tool-call",
+					toolCallId: part.toolCall.toolCallId,
+					toolName: part.toolCall.toolName,
+					input: part.toolCall.input,
+					...(part.toolCall.providerExecuted === undefined
+						? {}
+						: { providerExecuted: part.toolCall.providerExecuted }),
+					...(part.toolCall.providerMetadata === undefined
+						? {}
+						: { providerOptions: part.toolCall.providerMetadata }),
+				});
+			}
+			break;
+	}
+}
+
+function safeJsonValue(value: unknown): unknown {
+	try {
+		const encoded = JSON.stringify(value);
+		return encoded === undefined ? String(value) : JSON.parse(encoded);
+	} catch {
+		return String(value);
+	}
+}
+
+async function capturedToolOutput(
+	result: CapturedToolResult,
+	call: CapturedToolCall,
+	tools: ToolSet | undefined,
+): Promise<ToolResultPart["output"]> {
+	if (result.kind === "denied") {
+		return { type: "execution-denied", reason: "Tool execution was denied before cancellation." };
+	}
+	if (result.kind === "error") {
+		return { type: "error-text", value: serializeError(result.value).message };
+	}
+	const convert = (
+		tools?.[call.toolName] as
+			| {
+					toModelOutput?: (options: {
+						toolCallId: string;
+						input: unknown;
+						output: unknown;
+					}) => ToolResultPart["output"] | PromiseLike<ToolResultPart["output"]>;
+			  }
+			| undefined
+	)?.toModelOutput;
+	if (convert) {
+		try {
+			return await convert({
+				toolCallId: call.toolCallId,
+				input: result.input,
+				output: result.value,
+			});
+		} catch {
+			// Cancellation durability must not depend on an app converter. Fall
+			// through to the SDK's default JSON-shaped representation.
+		}
+	}
+	return { type: "json", value: safeJsonValue(result.value) as never };
+}
+
+async function messagesForCancelledStep(
+	capture: PartialStepCapture,
+	tools: ToolSet | undefined,
+): Promise<ModelMessage[]> {
+	const assistantContent: Array<{ type: "text"; text: string } | CapturedToolCall> = [];
+	if (capture.text.length > 0) assistantContent.push({ type: "text", text: capture.text });
+	assistantContent.push(...capture.toolCalls);
+	if (assistantContent.length === 0) return [];
+
+	const messages: ModelMessage[] = [{ role: "assistant", content: assistantContent }];
+	if (capture.toolCalls.length === 0) return messages;
+
+	const results: ToolResultPart[] = [];
+	for (const call of capture.toolCalls) {
+		const captured = capture.toolResults.get(call.toolCallId);
+		results.push({
+			type: "tool-result",
+			toolCallId: call.toolCallId,
+			toolName: call.toolName,
+			output: captured
+				? await capturedToolOutput(captured, call, tools)
+				: {
+						type: "error-text",
+						value: "Tool execution was interrupted because the run was cancelled.",
+					},
+		});
+	}
+	messages.push({ role: "tool", content: results });
+	return messages;
+}
+
+function unknownStepUsage(): StepUsage {
+	return {
+		inputTokens: null,
+		outputTokens: null,
+		totalTokens: null,
+		cachedInputTokens: null,
+		reasoningTokens: null,
+		cost: null,
+		upstreamCost: null,
+		billedCost: null,
+	};
+}
+
 const DEFAULT_POKE = (final: boolean) =>
 	`You ended your turn without calling submit_deliverable or cancel_task. ` +
 	`${final ? "This is your final chance — you MUST" : "You must"} call one of them now: ` +
@@ -225,6 +425,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 	let attempt = 0;
 	let pokes = 0;
 	let forceCompact = false;
+	let currentInputQueueIds: string[] = [];
 	// Progress since the last forced compaction — if a context-overflow error
 	// recurs with no new steps in between, compaction cannot save this run.
 	let progressSinceForcedCompaction = true;
@@ -238,9 +439,54 @@ export async function runLoop<TOOLS extends ToolSet>(
 		return { status: "failed", text: finalText, totals, error: serialized };
 	};
 
-	const cancel = async (reason: unknown): Promise<RunResult> => {
+	const cancel = async (
+		reason: unknown,
+		partial?: { messages: ModelMessage[]; text: string; toolCalls: CapturedToolCall[] },
+	): Promise<RunResult> => {
 		if (mailbox) mailbox.accepting = false;
 		const serialized = serializeError(reason ?? "Cancelled");
+		if (partial?.text.length) finalText = partial.text;
+		if (!runStarted) {
+			await append({ type: "run-start", at: now(), runId, model: agent.model });
+			runStarted = true;
+			emit({ type: "run-start", sessionId, runId, model: agent.model });
+		}
+		if (runStarted) {
+			const usage = unknownStepUsage();
+			try {
+				await append({
+					type: "step",
+					at: now(),
+					runId,
+					messages: agent.preserveProviderOptions
+						? (partial?.messages ?? [])
+						: stripProviderOptions(partial?.messages ?? []),
+					inputQueueIds: currentInputQueueIds,
+					acknowledgesInput: true,
+					finishReason: "cancelled",
+					usage,
+					interrupted: { status: "cancelled", error: serialized },
+				});
+			} catch (storageError) {
+				// Never report a durable cancellation when its visible partial step
+				// was not saved. Close as failed when storage still permits it.
+				return fail(storageError);
+			}
+			totals = addStepToTotals(totals, usage);
+			emit({
+				type: "step",
+				sessionId,
+				runId,
+				finishReason: "cancelled",
+				usage,
+				toolCalls: (partial?.toolCalls ?? []).map((call) => ({
+					toolName: call.toolName,
+					input: call.input,
+				})),
+				text: partial?.text ?? "",
+			});
+			currentInputQueueIds = [];
+		}
 		await append({ type: "run-end", at: now(), runId, status: "cancelled", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "cancelled", totals, error: serialized });
 		return { status: "cancelled", text: finalText, totals, error: serialized };
@@ -300,6 +546,10 @@ export async function runLoop<TOOLS extends ToolSet>(
 	};
 
 	while (true) {
+		// Queue ids are causal only once a model pass actually starts. In
+		// particular, pre-pass compaction can be aborted before the model that
+		// answers these inputs is ever called.
+		currentInputQueueIds = [];
 		if (options.abortSignal?.aborted) return cancel(options.abortSignal.reason);
 
 		const events = await storage.load(sessionId);
@@ -381,11 +631,17 @@ export async function runLoop<TOOLS extends ToolSet>(
 		let lastFinishReason = "";
 		let streamError: unknown;
 		let queueIdsForNextStep = inputQueueIds;
+		const partialStep = emptyPartialStepCapture();
 		// onStepFinish persistence is async; every pending append must settle
 		// before the next pass replays the session, or the replay races the
 		// writes it depends on.
 		const pendingAppends: Promise<unknown>[] = [];
 
+		// Storage/context lookup, compaction, and run-start persistence above can
+		// all yield. Do not mark queued inputs causal if cancellation landed
+		// before streamText is actually entered.
+		if (options.abortSignal?.aborted) return cancel(options.abortSignal.reason);
+		currentInputQueueIds = inputQueueIds;
 		const result = streamText({
 			model: options.getModel(agent.model, agent),
 			system: agent.system,
@@ -408,6 +664,10 @@ export async function runLoop<TOOLS extends ToolSet>(
 				...(agent.stopWhen ?? []),
 			],
 			onStepFinish: (step) => {
+				// This step is now represented by step.response.messages. Clear the
+				// live-part salvage buffer synchronously so an abort from an event
+				// listener cannot persist the same assistant output twice.
+				resetPartialStepCapture(partialStep);
 				const usage: StepUsage = extractStepUsage({
 					usage: step.usage,
 					providerMetadata: step.providerMetadata as Record<string, unknown> | undefined,
@@ -415,7 +675,10 @@ export async function runLoop<TOOLS extends ToolSet>(
 				const newMessages = step.response.messages.slice();
 				const acknowledgesInput = step.finishReason !== "error" && newMessages.length > 0;
 				const stepInputQueueIds = queueIdsForNextStep;
-				if (acknowledgesInput) queueIdsForNextStep = [];
+				if (acknowledgesInput) {
+					queueIdsForNextStep = [];
+					currentInputQueueIds = [];
+				}
 				pendingAppends.push(
 					Promise.resolve(
 						append({
@@ -460,6 +723,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// AI_NoOutputGeneratedError). Keep the richer chunk when both happen.
 		try {
 			for await (const part of result.fullStream) {
+				captureStreamPart(partialStep, part);
 				if (part.type === "error") streamError = part.error;
 				if (
 					part.type === "text-delta" ||
@@ -501,7 +765,13 @@ export async function runLoop<TOOLS extends ToolSet>(
 			return fail(storageError);
 		}
 
-		if (options.abortSignal?.aborted) return cancel(options.abortSignal.reason);
+		if (options.abortSignal?.aborted) {
+			return cancel(options.abortSignal.reason, {
+				messages: await messagesForCancelledStep(partialStep, tools),
+				text: partialStep.text,
+				toolCalls: partialStep.toolCalls,
+			});
+		}
 
 		// ── pass ended with a provider/stream error ──
 		if (streamError !== undefined) {
