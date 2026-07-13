@@ -155,6 +155,11 @@ if (agentic.isRunning(sessionId)) {
 `cancel()` returns `true` only when it newly requests cancellation. This is an
 explicit whole-run stop; unlike an initiating request's disconnect signal, it
 is not suppressed when other callers have durably queued input into the run.
+It closes only the active run: queued inputs that run never causally saw stay
+pending and automatically start one fresh successor run. Multiple pending
+inputs are batched into that successor's first model pass. Once that successor
+is running, a later `cancel()` targets it, so repeated Stop actions remain
+deterministic.
 
 When an automatic recovery reaches `maxAttempts`, queued-only work remains in
 the ledger and can still be retried with manual `resume()`; the cap prevents a

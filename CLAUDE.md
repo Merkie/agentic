@@ -92,6 +92,9 @@ the message in. Key invariants, in `src/run.ts`:
   pre-start registration window and auto-resume. `agentic.cancel(sessionId,
   reason)` is the deliberate whole-run escape hatch and, unlike an initiating
   caller's disconnect signal, is not suppressed by attached queued callers.
+  It terminates only that run; unseen queued inputs remain causally pending,
+  collapse into one automatically started successor run, and—once that
+  successor is running—can be stopped by a subsequent `cancel()`.
 
 ### Auto-resume (the boot sweep)
 

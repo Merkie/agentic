@@ -834,6 +834,21 @@ describe("explicit cancellation durability", () => {
 				onStarted?.();
 			},
 		});
+	const completedTextStream = (text: string) =>
+		convertArrayToReadableStream<LanguageModelV3StreamPart>([
+			{ type: "stream-start", warnings: [] },
+			{ type: "text-start", id: "complete" },
+			{ type: "text-delta", id: "complete", delta: text },
+			{ type: "text-end", id: "complete" },
+			{
+				type: "finish",
+				finishReason: { unified: "stop", raw: "stop" },
+				usage: {
+					inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+					outputTokens: { total: 5, text: 5, reasoning: undefined },
+				},
+			},
+		]);
 
 	it("durably closes a send whose signal was already aborted", async () => {
 		const modelId = "mock/cancel-pre-aborted";
@@ -1237,6 +1252,250 @@ describe("explicit cancellation durability", () => {
 			error: { message: "server stop" },
 		});
 		expect(agentic.isRunning("runtime-cancel-live")).toBe(false);
+	});
+
+	it("starts queued work in a successor run that can be cancelled independently", async () => {
+		const modelId = "mock/runtime-cancel-queued-successor";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => {
+				calls += 1;
+				return {
+					stream: hangingTextStream(
+						abortSignal,
+						calls === 1 ? "partial answer to A" : "partial answer to B",
+					),
+				};
+			},
+		});
+		let queued!: () => void;
+		const queuedDurably = new Promise<void>((resolve) => {
+			queued = resolve;
+		});
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message") queued();
+			},
+		});
+		const session = agentic.session("runtime-cancel-queued-successor", { model: modelId });
+		let firstDelta!: () => void;
+		const firstStreaming = new Promise<void>((resolve) => {
+			firstDelta = resolve;
+		});
+		let secondDelta!: () => void;
+		const secondStreaming = new Promise<void>((resolve) => {
+			secondDelta = resolve;
+		});
+
+		const first = session.send("A", {
+			onPart: (part) => {
+				if (part.type === "text-delta") firstDelta();
+			},
+		});
+		await firstStreaming;
+		const second = session.send("B", {
+			onPart: (part) => {
+				if (part.type === "text-delta") secondDelta();
+			},
+		});
+		await queuedDurably;
+
+		expect(agentic.cancel(session.id, new Error("stop A"))).toBe(true);
+		await expect(first).resolves.toMatchObject({
+			status: "cancelled",
+			text: "partial answer to A",
+			error: { message: "stop A" },
+		});
+		await secondStreaming;
+		expect(calls).toBe(2);
+		expect(agentic.isRunning(session.id)).toBe(true);
+		expect(agentic.cancel(session.id, new Error("stop B"))).toBe(true);
+		await expect(second).resolves.toMatchObject({
+			status: "cancelled",
+			text: "partial answer to B",
+			error: { message: "stop B" },
+		});
+
+		const events = await storage.load(session.id);
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(2);
+		const steps = events.filter(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(steps[0].inputQueueIds).toEqual([]);
+		expect(steps[1].inputQueueIds).toHaveLength(1);
+		expect(events.filter((event) => event.type === "run-end")).toEqual([
+			expect.objectContaining({
+				status: "cancelled",
+				error: expect.objectContaining({ message: "stop A" }),
+			}),
+			expect.objectContaining({
+				status: "cancelled",
+				error: expect.objectContaining({ message: "stop B" }),
+			}),
+		]);
+		expect(replaySession(events).pendingMessages).toBe(0);
+	});
+
+	it("does not replay queued input already included in the cancelled model pass", async () => {
+		const modelId = "mock/runtime-cancel-queued-included";
+		setContextWindow(modelId, 100_000);
+		const storage = memoryStorage();
+		let releaseFirst!: () => void;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let markFirstStarted!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			markFirstStarted = resolve;
+		});
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => {
+				calls += 1;
+				if (calls === 1) {
+					markFirstStarted();
+					await firstGate;
+					return { stream: completedTextStream("answer to A") };
+				}
+				return { stream: hangingTextStream(abortSignal, "partial answer including B") };
+			},
+		});
+		let queued!: () => void;
+		const queuedDurably = new Promise<void>((resolve) => {
+			queued = resolve;
+		});
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message") queued();
+			},
+		});
+		const session = agentic.session("runtime-cancel-queued-included", { model: modelId });
+		let secondDelta!: () => void;
+		const secondStreaming = new Promise<void>((resolve) => {
+			secondDelta = resolve;
+		});
+
+		const first = session.send("A");
+		await firstStarted;
+		const second = session.send("B", {
+			onPart: (part) => {
+				if (part.type === "text-delta") secondDelta();
+			},
+		});
+		await queuedDurably;
+		releaseFirst();
+		await secondStreaming;
+		expect(agentic.cancel(session.id, new Error("stop pass containing B"))).toBe(true);
+
+		await expect(Promise.all([first, second])).resolves.toEqual([
+			expect.objectContaining({ status: "cancelled", text: "partial answer including B" }),
+			expect.objectContaining({ status: "cancelled", text: "partial answer including B" }),
+		]);
+		expect(calls).toBe(2);
+		const events = await storage.load(session.id);
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "run-end")).toHaveLength(1);
+		const steps = events.filter(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(steps[1].inputQueueIds).toHaveLength(1);
+		expect(replaySession(events).pendingMessages).toBe(0);
+	});
+
+	it("batches every queued message into exactly one successor after cancellation", async () => {
+		const modelId = "mock/runtime-cancel-queued-batch";
+		setContextWindow(modelId, 100_000);
+		const base = memoryStorage();
+		let releaseQueuedAppend!: () => void;
+		const queuedAppendGate = new Promise<void>((resolve) => {
+			releaseQueuedAppend = resolve;
+		});
+		let markQueuedAppendStarted!: () => void;
+		const queuedAppendStarted = new Promise<void>((resolve) => {
+			markQueuedAppendStarted = resolve;
+		});
+		let blockFirstQueuedAppend = true;
+		const storage = {
+			...base,
+			append: async (sessionId: string, event: StoredEvent) => {
+				if (
+					blockFirstQueuedAppend &&
+					event.type === "user-message" &&
+					event.meta?.queued === true
+				) {
+					blockFirstQueuedAppend = false;
+					markQueuedAppendStarted();
+					await queuedAppendGate;
+				}
+				await base.append(sessionId, event);
+			},
+		};
+		const prompts: ModelMessage[][] = [];
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal, prompt }) => {
+				calls += 1;
+				prompts.push(prompt);
+				if (calls === 1) {
+					return { stream: hangingTextStream(abortSignal, "partial answer to A") };
+				}
+				return { stream: completedTextStream("one answer for B, C, and D") };
+			},
+		});
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+		});
+		const session = agentic.session("runtime-cancel-queued-batch", { model: modelId });
+		let firstDelta!: () => void;
+		const firstStreaming = new Promise<void>((resolve) => {
+			firstDelta = resolve;
+		});
+
+		const first = session.send("A", {
+			onPart: (part) => {
+				if (part.type === "text-delta") firstDelta();
+			},
+		});
+		await firstStreaming;
+		const queued = [session.send("B"), session.send("C"), session.send("D")];
+		// B is blocked inside persistence while C and D are attached behind it.
+		// Cancellation must wait for the complete intake set before any sender
+		// takes the recovery snapshot.
+		await queuedAppendStarted;
+
+		expect(agentic.cancel(session.id, new Error("stop A only"))).toBe(true);
+		releaseQueuedAppend();
+		await expect(first).resolves.toMatchObject({
+			status: "cancelled",
+			text: "partial answer to A",
+		});
+		await expect(Promise.all(queued)).resolves.toEqual([
+			expect.objectContaining({ status: "completed", text: "one answer for B, C, and D" }),
+			expect.objectContaining({ status: "completed", text: "one answer for B, C, and D" }),
+			expect.objectContaining({ status: "completed", text: "one answer for B, C, and D" }),
+		]);
+
+		expect(calls).toBe(2);
+		const successorPrompt = JSON.stringify(prompts[1]);
+		for (const content of ["B", "C", "D"]) {
+			expect(successorPrompt.match(new RegExp(`"${content}"`, "g"))).toHaveLength(1);
+		}
+		const events = await storage.load(session.id);
+		expect(events.filter((event) => event.type === "run-start")).toHaveLength(2);
+		expect(events.filter((event) => event.type === "run-end")).toHaveLength(2);
+		const steps = events.filter(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(steps[0].inputQueueIds).toEqual([]);
+		expect(steps[1].inputQueueIds).toHaveLength(3);
+		expect(replaySession(events).pendingMessages).toBe(0);
 	});
 
 	it("can cancel the registered run before its initial durable append settles", async () => {
