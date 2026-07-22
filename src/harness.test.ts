@@ -12,7 +12,7 @@ import { createMailbox, hoistSandwichedUsers, runLoop } from "./run.js";
 import { sanitizeConversation } from "./sanitize.js";
 import { memoryStorage } from "./storage.js";
 import type { StepUsage, StoredEvent } from "./types.js";
-import { reconcileBilledCost } from "./usage.js";
+import { extractStepUsage, reconcileBilledCost } from "./usage.js";
 
 const usage = (partial: Partial<StepUsage> = {}): StepUsage => ({
 	inputTokens: 100,
@@ -22,6 +22,7 @@ const usage = (partial: Partial<StepUsage> = {}): StepUsage => ({
 	reasoningTokens: null,
 	cost: 0.001,
 	upstreamCost: null,
+	isByok: null,
 	billedCost: 0.001,
 	...partial,
 });
@@ -91,12 +92,62 @@ describe("retryDelayMs", () => {
 	});
 });
 
-describe("reconcileBilledCost (BYOK)", () => {
-	it("sums credits cost and upstream cost", () => {
-		expect(reconcileBilledCost(0.001, null)).toBe(0.001); // OpenRouter credits
-		expect(reconcileBilledCost(0, 0.0005)).toBe(0.0005); // BYOK, no fee
-		expect(reconcileBilledCost(0.000025, 0.0005)).toBe(0.000525); // BYOK + 5% fee
+describe("reconcileBilledCost (BYOK vs credits)", () => {
+	it("sums fee + provider charge on BYOK", () => {
+		expect(reconcileBilledCost(0, 0.0005, true)).toBe(0.0005); // BYOK, no fee
+		expect(reconcileBilledCost(0.000025, 0.0005, true)).toBe(0.000525); // BYOK + 5% fee
+		expect(reconcileBilledCost(null, 0.0005, true)).toBe(0.0005);
+	});
+	it("takes cost alone on credits — upstream is a mirror, not a charge", () => {
+		expect(reconcileBilledCost(0.000003752, 0.000003752, false)).toBe(0.000003752);
+		expect(reconcileBilledCost(0.001, null, false)).toBe(0.001);
+	});
+	it("never sums when is_byok is unknown", () => {
+		expect(reconcileBilledCost(0.001, null)).toBe(0.001); // pre-is_byok credits
+		expect(reconcileBilledCost(0.001, 0.001)).toBe(0.001); // mirrored payload, no flag
+		expect(reconcileBilledCost(null, 0.0005)).toBe(0.0005);
 		expect(reconcileBilledCost(null, null)).toBeNull();
+	});
+});
+
+describe("extractStepUsage (is_byok classification)", () => {
+	const raw = (over: Record<string, unknown>) =>
+		({
+			usage: {
+				inputTokens: 249,
+				outputTokens: 10,
+				totalTokens: 259,
+				raw: over,
+			},
+		}) as Parameters<typeof extractStepUsage>[0];
+
+	it("reads is_byok from usage.raw and sums the BYOK charge", () => {
+		const u = extractStepUsage(
+			raw({ cost: 0, is_byok: true, cost_details: { upstream_inference_cost: 0.0000113176 } }),
+		);
+		expect(u.isByok).toBe(true);
+		expect(u.billedCost).toBeCloseTo(0.0000113176, 12);
+	});
+
+	it("does not double-count a mirrored credits payload", () => {
+		const u = extractStepUsage(
+			raw({
+				cost: 0.0000025872,
+				is_byok: false,
+				cost_details: { upstream_inference_cost: 0.0000025872 },
+			}),
+		);
+		expect(u.isByok).toBe(false);
+		expect(u.upstreamCost).toBeCloseTo(0.0000025872, 12); // kept as data
+		expect(u.billedCost).toBeCloseTo(0.0000025872, 12); // charged once
+	});
+
+	it("treats a missing is_byok as unknown and never sums", () => {
+		const u = extractStepUsage(
+			raw({ cost: 0.001, cost_details: { upstream_inference_cost: 0.001 } }),
+		);
+		expect(u.isByok).toBeNull();
+		expect(u.billedCost).toBe(0.001);
 	});
 });
 

@@ -41,8 +41,11 @@ plumbing once, battle-tested, so your code is just models, prompts, and tools.
   provider-reported token counts against the model's actual context window
   (fetched from OpenRouter), summarizes into a hand-off message, and keeps
   going — silently between turns, or mid-run for agents deep in a task.
-- **Cost is tracked correctly**, including BYOK: OpenRouter credits report
-  `cost`; BYOK reports the provider charge in `upstream_inference_cost`.
+- **Cost is tracked correctly**, including BYOK: OpenRouter's `is_byok` flag
+  picks the billing rule. BYOK requests bill fee (`cost`) + provider charge
+  (`upstream_inference_cost`); credits requests bill `cost` alone — OpenRouter
+  mirrors the upstream figure on credits requests too, so summing blindly
+  would double-count. When `is_byok` is absent the harness never sums.
   Per-step usage/cost is persisted, aggregated per run and per session.
 
 ## Install
@@ -179,7 +182,7 @@ Everything the harness is built from is exported for use with plain
 | `createResilientFetch` | header + SSE-idle stall detection for hung connections |
 | `sanitizeConversation` | heal interrupted/malformed tool-call transcripts before replay |
 | `guardToolResultSizes` | cap tool results so one result can't blow the context window |
-| `extractStepUsage` | per-step tokens + BYOK-reconciled cost from provider metadata |
+| `extractStepUsage` | per-step tokens + `is_byok`-aware billed cost (BYOK vs credits) |
 | `getContextWindow` | a model's context length from OpenRouter, memoized |
 | `encodeEvent` / `decodeEvent` | binary-safe StoredEvent serialization for custom adapters |
 | `serializedStorage` | serialize custom-adapter operations per session |

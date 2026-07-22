@@ -382,6 +382,7 @@ function unknownStepUsage(): StepUsage {
 		reasoningTokens: null,
 		cost: null,
 		upstreamCost: null,
+		isByok: null,
 		billedCost: null,
 	};
 }

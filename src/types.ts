@@ -5,10 +5,14 @@ export type MaybePromise<T> = T | Promise<T>;
 // ── usage & cost ────────────────────────────────────────────────────────
 
 /**
- * Normalized per-step usage. `cost` is what OpenRouter charged in credits;
- * `upstreamCost` is the underlying provider charge (populated on BYOK where
- * `cost` is just OpenRouter's fee or 0). `billedCost` is the reconciled
- * "what this actually cost me" number — see {@link reconcileBilledCost}.
+ * Normalized per-step usage. `cost` is what OpenRouter charged in credits
+ * (on BYOK requests: just OpenRouter's fee, often 0). `upstreamCost` is the
+ * underlying provider charge — on BYOK it's the real bill; on credits
+ * requests OpenRouter mirrors what it paid the provider here, so it is
+ * informational, NOT an extra charge. `isByok` is OpenRouter's discriminator
+ * between the two regimes (null when not reported). `billedCost` is the
+ * reconciled "what this actually cost me" number — see
+ * {@link reconcileBilledCost}. Only `billedCost` belongs in spend totals.
  */
 export interface StepUsage {
 	inputTokens: number | null;
@@ -18,6 +22,7 @@ export interface StepUsage {
 	reasoningTokens: number | null;
 	cost: number | null;
 	upstreamCost: number | null;
+	isByok: boolean | null;
 	billedCost: number | null;
 }
 

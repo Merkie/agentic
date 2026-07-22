@@ -4,29 +4,48 @@ import type { StepUsage, UsageTotals } from "./types.js";
 // Per-step usage + cost extraction. Cost only exists when the model is served
 // through OpenRouter (usage accounting), and it arrives in two shapes:
 // camelCase on providerMetadata.openrouter.usage and snake_case on usage.raw.
+// The `is_byok` discriminator ONLY survives on the raw snake_case shape —
+// @openrouter/ai-sdk-provider (≤2.3.3) whitelists what it copies into the
+// camelCase metadata and drops it — so extraction must read both.
 
 interface OpenRouterUsageMeta {
 	cost?: number;
 	costDetails?: { upstreamInferenceCost?: number | null };
+	isByok?: boolean;
 }
 
 interface RawUsage {
 	cost?: number;
 	cost_details?: { upstream_inference_cost?: number | null };
+	is_byok?: boolean;
 }
 
 /**
- * Reconcile OpenRouter's two cost fields into "what this step actually cost".
- * Paying with OpenRouter credits puts the charge in `cost`; BYOK requests
- * report the OpenRouter fee (often 0) in `cost` with the real provider charge
- * in `upstream_inference_cost` — so a BYOK step's true cost is the sum.
+ * Reconcile OpenRouter's cost fields into "what this step actually cost".
+ * Which field carries the real charge depends on the billing regime, which
+ * OpenRouter reports via `is_byok`:
+ *
+ * - BYOK (`isByok === true`): `cost` is OpenRouter's fee (often 0) and the
+ *   real provider charge is in `upstream_inference_cost` — the true cost is
+ *   the sum of the two.
+ * - Credits (`isByok === false`): `cost` is the full charge. Since mid-2026
+ *   OpenRouter also mirrors what it paid the provider into
+ *   `upstream_inference_cost` on credits requests (informational, not an
+ *   extra charge), so summing would double-count — the true cost is `cost`
+ *   alone.
+ * - Unknown (`isByok` missing — pre-`is_byok` payloads or models not served
+ *   through OpenRouter): never sum. Take `cost`, falling back to
+ *   `upstreamCost`; doubling a mirrored credits charge is worse than
+ *   undercounting a fee-only BYOK figure.
  */
 export function reconcileBilledCost(
 	cost: number | null,
 	upstreamCost: number | null,
+	isByok: boolean | null = null,
 ): number | null {
 	if (cost === null && upstreamCost === null) return null;
-	return (cost ?? 0) + (upstreamCost ?? 0);
+	if (isByok === true) return (cost ?? 0) + (upstreamCost ?? 0);
+	return cost ?? upstreamCost;
 }
 
 /**
@@ -47,6 +66,7 @@ export function extractStepUsage(step: {
 	const cost = meta?.cost ?? raw?.cost ?? null;
 	const upstreamCost =
 		meta?.costDetails?.upstreamInferenceCost ?? raw?.cost_details?.upstream_inference_cost ?? null;
+	const isByok = meta?.isByok ?? raw?.is_byok ?? null;
 
 	const details = usage as {
 		inputTokenDetails?: { cacheReadTokens?: number | null };
@@ -61,7 +81,8 @@ export function extractStepUsage(step: {
 		reasoningTokens: details.outputTokenDetails?.reasoningTokens ?? null,
 		cost,
 		upstreamCost,
-		billedCost: reconcileBilledCost(cost, upstreamCost),
+		isByok,
+		billedCost: reconcileBilledCost(cost, upstreamCost, isByok),
 	};
 }
 

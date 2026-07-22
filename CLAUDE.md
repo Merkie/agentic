@@ -46,8 +46,8 @@ recovery, resume, message queueing, and auditing all fall out of this.
 - `src/sanitize.ts` — heals interrupted transcripts (dangling tool calls)
   before replay.
 - `src/openrouter.ts` / `src/modelMeta.ts` / `src/usage.ts` — provider
-  factory, context-window lookup, per-step usage/cost extraction
-  (BYOK-aware).
+  factory, context-window lookup, per-step usage/cost extraction (see
+  "Billing" below).
 - `src/resilientFetch.ts` — header + SSE-idle stall detection.
 - `src/toolGuard.ts` — caps tool result sizes.
 - `src/logEvents.ts` — the default console logger (`createAgentic({ logs:
@@ -111,6 +111,25 @@ work durable for a later manual `resume()`. Sweeps keep at most `maxConcurrent`
 (default 4) resumed runs in flight, while `staggerMs` optionally spaces their
 starts. Manual `resume()` is uncapped. Sweep kicks re-check under the session
 lock, so racing sweeps/sends never double-resume.
+
+### Billing (BYOK vs credits)
+
+Cost extraction (`src/usage.ts`) is `is_byok`-aware. OpenRouter usage
+accounting reports `cost` plus `cost_details.upstream_inference_cost`, and
+which one is the real charge depends on the billing regime — since mid-2026
+the upstream figure is populated on credits-paid requests too, as a mirror
+of what OpenRouter paid the provider (informational, not an extra charge),
+so the field's presence no longer identifies BYOK. `reconcileBilledCost`
+branches on OpenRouter's `is_byok` flag: BYOK → sum (`cost` is the fee,
+often 0; upstream is the provider bill); credits → `cost` alone (summing
+would double-count the mirror); flag absent → never sum, take `cost` falling
+back to upstream, because doubling a mirrored credits charge is worse than
+undercounting a fee-only BYOK payload. `is_byok` only survives on the raw
+snake_case usage payload (`usage.raw`) — `@openrouter/ai-sdk-provider`
+(≤2.3.3) drops it from the camelCase `providerMetadata.openrouter.usage` —
+so `extractStepUsage` reads both shapes and keeps all three numbers on
+`StepUsage` (`cost`, `upstreamCost`, `isByok`, reconciled `billedCost`).
+Totals accumulate `billedCost`, never raw `cost`.
 
 ## Testing
 
