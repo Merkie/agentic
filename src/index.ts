@@ -28,6 +28,7 @@ export {
 	type OpenRouterProvider,
 	type OpenRouterProviderSettings,
 } from "./openrouter.js";
+export { type ProgressEvent, progressFromPart } from "./progress.js";
 export {
 	type ProjectedInput,
 	type ProjectedRun,

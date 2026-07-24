@@ -149,6 +149,21 @@ export interface Session<TOOLS extends ToolSet = ToolSet> {
 	 */
 	resume(options?: Pick<SendOptions<TOOLS>, "onPart" | "abortSignal">): Promise<RunResult | null>;
 	/**
+	 * Session-scoped live tail: while attached, the listener receives every
+	 * stream part (with its {@link StreamContext}) from ANY run executing for
+	 * this session in this process — the currently live run and runs that
+	 * start later, tasks included. Live-only and best-effort like onPart:
+	 * nothing is replayed, and a throwing listener is contained and never
+	 * breaks a run. Attaching while idle is valid and simply delivers nothing
+	 * until a run starts. Returns a detach function.
+	 *
+	 * Reconnect recipe: attach first (buffering parts), then read transcript();
+	 * drop buffered/incoming text deltas whose `context.offset` is less than
+	 * the streaming item's `partialText.length` and append the rest — the
+	 * snapshot and the stream can then never double-render a character.
+	 */
+	attach(listener: (part: TextStreamPart<TOOLS>, context: StreamContext) => void): () => void;
+	/**
 	 * The replay-ready conversation as the model would see it, each message
 	 * carrying its durable ledger id and persist time.
 	 */
@@ -284,6 +299,11 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 	}
 	const liveRuns = new Map<string, LiveRun>();
 
+	// Session-scoped live-tail listeners (Session.attach). Keyed by session id
+	// and read at part-delivery time, so attaching/detaching mid-run takes
+	// effect immediately and one registration spans every future run.
+	const attachedListeners = new Map<string, Set<(part: unknown, context: StreamContext) => void>>();
+
 	// Start a run registered in the live-run map so concurrent send()s can
 	// queue into it. Must be called while holding the session lock.
 	function execRun<TOOLS extends ToolSet>(
@@ -321,6 +341,29 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				detachAbortListener = () => initiatingSignal.removeEventListener("abort", forwardAbort);
 			}
 		}
+		// Every run entry point flows through here, so composing the session's
+		// attach() broadcast over the caller's onPart makes live-tailing cover
+		// fresh sends, queued recovery, resume, the auto-resume sweep, and tasks
+		// alike. The registry is read per part, so mid-run attach/detach works.
+		const callerOnPart = runOptions.onPart;
+		const onPart = (part: TextStreamPart<TOOLS>, context: StreamContext) => {
+			if (callerOnPart) {
+				try {
+					callerOnPart(part, context);
+				} catch {
+					// a broken caller listener must not starve attached listeners
+				}
+			}
+			const attached = attachedListeners.get(sessionId);
+			if (!attached || attached.size === 0) return;
+			for (const listener of [...attached]) {
+				try {
+					listener(part, context);
+				} catch {
+					// error-contained, like onPart
+				}
+			}
+		};
 		const result = runLoop<TOOLS>({
 			sessionId,
 			agent,
@@ -329,6 +372,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			emit: emitEvent,
 			mailbox,
 			...runOptions,
+			onPart,
 			abortSignal: controller.signal,
 		});
 		liveRuns.set(sessionId, { mailbox, result, controller });
@@ -739,6 +783,24 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					);
 				});
 			},
+			attach(listener) {
+				let listeners = attachedListeners.get(id);
+				if (!listeners) {
+					listeners = new Set();
+					attachedListeners.set(id, listeners);
+				}
+				// A per-attach delegate, so attaching the same function twice yields
+				// two independent subscriptions with independent detach handles.
+				const entry = (part: unknown, context: StreamContext) =>
+					listener(part as TextStreamPart<TOOLS>, context);
+				listeners.add(entry);
+				return () => {
+					const current = attachedListeners.get(id);
+					if (!current) return;
+					current.delete(entry);
+					if (current.size === 0) attachedListeners.delete(id);
+				};
+			},
 			resume(resumeOptions = {}) {
 				return withSessionLock(id, async () => {
 					let events = await storage.load(id);
@@ -767,10 +829,27 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				return replaySession(await storage.load(id)).messages;
 			},
 			async transcript(transcriptOptions = {}) {
-				return projectSession(await storage.load(id), {
+				const transcript = projectSession(await storage.load(id), {
 					live: liveRuns.has(id),
 					internal: transcriptOptions.internal,
 				});
+				// Overlay the in-flight pass's text-so-far onto its streaming response
+				// item (see TranscriptResponseItem.partialText). projectSession stays
+				// pure over the ledger; the mirror lives on the live run's mailbox and
+				// is nulled the moment the pass's step persists or the run ends.
+				const partial = liveRuns.get(id)?.mailbox.partial;
+				if (partial) {
+					for (const item of transcript.items) {
+						if (
+							item.kind === "response" &&
+							item.id === partial.responseId &&
+							item.status === "streaming"
+						) {
+							item.partialText = partial.text;
+						}
+					}
+				}
+				return transcript;
 			},
 			async stats() {
 				const replayed = replaySession(await storage.load(id));

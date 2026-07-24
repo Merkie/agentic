@@ -79,6 +79,13 @@ export interface RunMailbox {
 	 * whatever the dead run never flushed.
 	 */
 	acceptHooks: Array<(runId: string) => void>;
+	/**
+	 * Mirror of the in-flight model pass's accumulated text, keyed by the
+	 * transcript response item it streams into. `Session.transcript()` overlays
+	 * it as `partialText`. Null outside a streaming pass: cleared the moment the
+	 * pass's step persists (durable text supersedes it) and on run end.
+	 */
+	partial: { responseId: string; text: string } | null;
 	/** Signal a new ledger message. Returns false if the run stopped listening. */
 	tryEnqueue(queueId: string): boolean;
 }
@@ -92,6 +99,7 @@ export function createMailbox(): RunMailbox {
 		partListeners: [],
 		queuedPartListeners: [],
 		acceptHooks: [],
+		partial: null,
 		tryEnqueue(queueId: string) {
 			if (!mailbox.accepting) return false;
 			mailbox.attachedQueueIds.add(queueId);
@@ -466,7 +474,10 @@ export async function runLoop<TOOLS extends ToolSet>(
 	const startedAt = Date.now();
 
 	const fail = async (error: unknown): Promise<RunResult> => {
-		if (mailbox) mailbox.accepting = false;
+		if (mailbox) {
+			mailbox.accepting = false;
+			mailbox.partial = null;
+		}
 		const serialized = serializeError(error);
 		await append({ type: "run-end", at: now(), runId, status: "failed", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "failed", totals, error: serialized });
@@ -484,7 +495,10 @@ export async function runLoop<TOOLS extends ToolSet>(
 		reason: unknown,
 		partial?: { messages: ModelMessage[]; text: string; toolCalls: CapturedToolCall[] },
 	): Promise<RunResult> => {
-		if (mailbox) mailbox.accepting = false;
+		if (mailbox) {
+			mailbox.accepting = false;
+			mailbox.partial = null;
+		}
 		const serialized = serializeError(reason ?? "Cancelled");
 		if (partial?.text.length) finalText = partial.text;
 		if (!runStarted) {
@@ -757,8 +771,11 @@ export async function runLoop<TOOLS extends ToolSet>(
 			onStepFinish: (step) => {
 				// This step is now represented by step.response.messages. Clear the
 				// live-part salvage buffer synchronously so an abort from an event
-				// listener cannot persist the same assistant output twice.
+				// listener cannot persist the same assistant output twice. The
+				// transcript's partial-text mirror clears with it: from here on the
+				// durable step is the source of this pass's text.
 				resetPartialStepCapture(partialStep);
+				if (mailbox) mailbox.partial = null;
 				const usage: StepUsage = extractStepUsage({
 					usage: step.usage,
 					providerMetadata: step.providerMetadata as Record<string, unknown> | undefined,
@@ -821,7 +838,17 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// AI_NoOutputGeneratedError). Keep the richer chunk when both happen.
 		try {
 			for await (const part of result.fullStream) {
+				// A text delta's offset is the partial text BEFORE the delta is folded
+				// in — the same accumulation transcript() overlays as partialText, so
+				// `offset < partialText.length` is an exact reconnect dedupe test.
+				const partContext: StreamContext =
+					part.type === "text-delta"
+						? { ...streamContext, offset: partialStep.text.length }
+						: streamContext;
 				captureStreamPart(partialStep, part);
+				if (mailbox && part.type === "text-delta") {
+					mailbox.partial = { responseId: streamContext.responseId, text: partialStep.text };
+				}
 				if (part.type === "error") streamError = part.error;
 				if (
 					part.type === "text-delta" ||
@@ -831,13 +858,13 @@ export async function runLoop<TOOLS extends ToolSet>(
 					observableProgress = true;
 				}
 				try {
-					options.onPart?.(part, streamContext);
+					options.onPart?.(part, partContext);
 				} catch {
 					// a broken part listener must never kill a run
 				}
 				for (const listener of mailbox?.partListeners ?? []) {
 					try {
-						listener(part, streamContext);
+						listener(part, partContext);
 					} catch {
 						// same rule for attached listeners
 					}
@@ -845,7 +872,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 				for (const subscription of mailbox?.queuedPartListeners ?? []) {
 					if (!subscription.active) continue;
 					try {
-						subscription.listener(part, streamContext);
+						subscription.listener(part, partContext);
 					} catch {
 						// same rule for causally attached listeners
 					}
@@ -958,7 +985,10 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// Point of no return: refuse new mailbox enqueues synchronously BEFORE
 		// the run-end append, so a send() racing this exit falls back to
 		// starting its own run instead of attaching to one that won't look.
-		if (mailbox) mailbox.accepting = false;
+		if (mailbox) {
+			mailbox.accepting = false;
+			mailbox.partial = null;
+		}
 		await append({ type: "run-end", at: now(), runId, status: "completed" });
 		emit({ type: "run-end", sessionId, runId, status: "completed", totals });
 		// The model finished its turn over the threshold — compact silently

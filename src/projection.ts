@@ -252,6 +252,13 @@ export interface TranscriptResponseItem {
 	/** The segment's stored messages (assistant + tool), for rich rendering. */
 	messages: SessionMessage[];
 	status: ResponseStatus;
+	/**
+	 * Accumulated text of the in-flight model pass — present only while status
+	 * is "streaming". Overlaid by `Session.transcript()` from the live run in
+	 * this process; `projectSession` itself is pure over the ledger and never
+	 * sets it. Superseded by durable `text` the moment the pass's step persists.
+	 */
+	partialText?: string;
 	/** The run's failure, when status is "failed". */
 	error?: SerializedError;
 }
@@ -270,6 +277,8 @@ export interface StreamContext {
 	runId: string;
 	/** The transcript response item this pass streams into: `${runId}/${segmentIndex}`. */
 	responseId: string;
+	/** For text-delta parts: chars of the current pass's partial text BEFORE this delta. */
+	offset?: number;
 }
 
 export interface SessionTranscript {

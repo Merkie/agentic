@@ -144,6 +144,32 @@ and paired with timestamps:
 for disposable presentation work that needs task validation/retries but should
 not create a recoverable session in the configured storage.
 
+### Live reattachment (v0.8)
+
+- `session.attach(listener)` live-tails a session: every stream part (with
+  `StreamContext`) from ANY run this process executes for it — the currently
+  live run and runs that start later. Best-effort/live-only like `onPart`,
+  error-contained, detach via the returned function. Every entry point that
+  goes through the internal `execRun` broadcasts (send, queued recovery,
+  resume, auto-resume sweep, and tasks — including `durable: false` ones, which
+  only isolate storage); direct `runLoop()` use does not (no instance
+  registry).
+- The loop mirrors the in-flight pass's accumulated text on `mailbox.partial`
+  (nulled the moment the step persists and on run end); `Session.transcript()`
+  overlays it as `partialText` on the matching "streaming" response item —
+  `projectSession` itself stays pure over the ledger. Text-delta deliveries
+  carry `StreamContext.offset` (chars of the pass's partial text before the
+  delta), so a reconnecting client attaches first, snapshots `transcript()`,
+  and drops deltas with `offset < partialText.length` — snapshot and stream
+  never double-render.
+- `progressFromPart(part, context)` (src/progress.ts) is the canonical
+  activity vocabulary: pure mapping to JSON-serializable `ProgressEvent`s —
+  text (delta + offset), reasoning, tool-start (from `tool-call`, the one part
+  every provider emits exactly once), tool-end (non-preliminary
+  `tool-result`); everything else null. No tool payloads on the wire;
+  terminal/lifecycle state comes from `onAccepted`/`RunResult`/the transcript,
+  not this stream.
+
 ### Auto-resume (the boot sweep)
 
 `createAgentic({ autoResume: (sessionId) => agentConfig })` makes crash
