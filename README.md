@@ -89,14 +89,17 @@ const outcome = await agentic.task({
   },
   prompt: "Look up ACC-1001's balance for its authenticated owner and submit it.",
   deliverable: z.object({ accountId: z.string(), balance: z.number() }),
+  // durable: false, // opt out of the ledger for a disposable one-shot
 });
 // outcome.status: "submitted" (typed deliverable) | "cancelled" (model's
 // escape hatch or an explicit abort, with reason) | "failed" (bounded retries exhausted)
 ```
 
-Every session — chats, workflows, one-shots — shares the same ledger, so all
-of it is resumable, auditable, and cost-tracked. Observability is one flag —
-or one hook:
+Sessions and tasks share the same ledger by default, so they are resumable,
+auditable, and cost-tracked. Presentation helpers and other disposable work can
+set `task({ durable: false })`; the task still gets retries, validation, and a
+guaranteed outcome, but its generated session stays in memory. Observability is
+one flag—or one hook:
 
 ```ts
 createAgentic({ logs: true })            // colored console line per event
@@ -124,12 +127,30 @@ those when projecting a user-visible transcript. Compaction summarizes older
 multimodal turns as text, so binary parts only remain verbatim when they fall
 inside `keepRecent`.
 
+Every message is identified and timestamped. User messages carry an `id` on
+their ledger event; assistant/tool messages are persisted as
+`{ id, message }` envelopes inside each `step` (tool calls additionally keep
+the AI SDK's `toolCallId`). `session.messages()` returns
+`{ id, at, message }` entries — ids are minted once at append time and are
+stable across replays, restarts, and compaction (a compacted-away tail
+message keeps its original id and persist time in the new base; only the
+summary message gets a fresh id). Live `AgenticEvent`s are stamped with `at`,
+and the live `step` event carries the same identified messages the ledger
+recorded, so a UI can reconcile its streamed draft against durable identities
+without reloading. `RunResult` names the run that produced it (`runId`), so a
+resolved `send()`/`resume()` correlates directly with run/step events and
+their messages. Ledgers written before v0.7 still replay; their messages just
+come back with `id: null`.
+
 Queued-input causality is recorded on each `step`; raw append order alone is
 not a transcript (an in-flight step can be persisted after a newly arrived
 user message without having seen it). Use `session.messages()` or
-`replaySession()` for projections. A durable non-error step, including a tool
-call/result step, counts as having handled the queued input it records. If the
-run later fails, callers receive that failure and the input is not replayed
+`replaySession()` for the model conversation. UI/database adapters should call
+`projectRun(events, runId)`, which returns causal response segments and the
+inputs still pending after that run; adapters only decide what is visible and
+write it to their own schema. A durable non-error step, including a tool
+call/result step, counts as having handled the input ids it records. If the run
+later fails, callers receive that failure and the input is not replayed
 automatically, avoiding duplicate tool side effects. An input that only saw an
 empty/error step remains pending for recovery.
 

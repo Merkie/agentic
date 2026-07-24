@@ -11,8 +11,12 @@ import { replaySession } from "./replay.js";
 import { createMailbox, hoistSandwichedUsers, runLoop } from "./run.js";
 import { sanitizeConversation } from "./sanitize.js";
 import { memoryStorage } from "./storage.js";
-import type { StepUsage, StoredEvent } from "./types.js";
+import type { AgenticEvent, StepUsage, StoredEvent, StoredMessage } from "./types.js";
 import { extractStepUsage, reconcileBilledCost } from "./usage.js";
+
+let storedSeq = 0;
+const stored = (...messages: ModelMessage[]): StoredMessage[] =>
+	messages.map((message) => ({ id: `sm-${++storedSeq}`, message }));
 
 const usage = (partial: Partial<StepUsage> = {}): StepUsage => ({
 	inputTokens: 100,
@@ -160,7 +164,7 @@ describe("replaySession", () => {
 				type: "step",
 				at: "t",
 				runId: "r1",
-				messages: [{ role: "assistant", content: "hello" }],
+				messages: stored({ role: "assistant", content: "hello" }),
 				finishReason: "stop",
 				usage: usage(),
 			},
@@ -168,14 +172,14 @@ describe("replaySession", () => {
 			{
 				type: "compaction",
 				at: "t",
-				messages: [{ role: "user", content: "<summary>" }],
+				messages: stored({ role: "user", content: "<summary>" }),
 				usage: usage({ inputTokens: 5000, cost: 0.002, billedCost: 0.002 }),
 			},
 			{ type: "user-message", at: "t", message: { role: "user", content: "again" } },
 			{ type: "run-start", at: "t", runId: "r2", model: "m" },
 		];
 		const replayed = replaySession(events);
-		expect(replayed.messages.map((m) => m.content)).toEqual(["<summary>", "again"]);
+		expect(replayed.messages.map((m) => m.message.content)).toEqual(["<summary>", "again"]);
 		expect(replayed.interruptedRunId).toBe("r2");
 		expect(replayed.contextTokens).toBeNull(); // compaction reset, no step since
 		expect(replayed.totals.cost).toBeCloseTo(0.003);
@@ -187,7 +191,7 @@ describe("replaySession", () => {
 			type: "step",
 			at: "t",
 			runId: "r1",
-			messages: [{ role: "assistant", content: "hello" }],
+			messages: stored({ role: "assistant", content: "hello" }),
 			finishReason: "stop",
 			usage: usage(),
 		};
@@ -253,7 +257,7 @@ describe("replaySession", () => {
 				type: "step",
 				at: "t3",
 				runId: "r1",
-				messages: [{ role: "assistant", content: "answer to A" }],
+				messages: stored({ role: "assistant", content: "answer to A" }),
 				inputQueueIds: [],
 				finishReason: "stop",
 				usage: usage(),
@@ -272,7 +276,7 @@ describe("replaySession", () => {
 				type: "step",
 				at: "t6",
 				runId: "r2",
-				messages: [{ role: "assistant", content: "answer to B" }],
+				messages: stored({ role: "assistant", content: "answer to B" }),
 				inputQueueIds: ["q-b"],
 				finishReason: "stop",
 				usage: usage(),
@@ -445,6 +449,40 @@ describe("validated tasks", () => {
 		expect(calls).toBe(1);
 	});
 
+	it("can run a one-shot task without creating a durable session", async () => {
+		setContextWindow("mock/ephemeral-task", 100_000);
+		const model = new MockLanguageModelV3({
+			doStream: async () => ({
+				stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+					{ type: "stream-start", warnings: [] },
+					{
+						type: "tool-call",
+						toolCallId: "submit-ephemeral",
+						toolName: "submit_deliverable",
+						input: JSON.stringify({ deliverable: { value: "temporary" } }),
+					},
+					finish(),
+				]),
+			}),
+		});
+		const storage = memoryStorage();
+		const agentic = createAgentic({ storage, getModel: () => model });
+
+		await expect(
+			agentic.task({
+				id: "ephemeral-task",
+				durable: false,
+				agent: { model: "mock/ephemeral-task" },
+				prompt: "Return a value.",
+				deliverable: z.object({ value: z.string() }),
+			}),
+		).resolves.toMatchObject({
+			status: "submitted",
+			deliverable: { value: "temporary" },
+		});
+		expect(await storage.listSessions?.()).toEqual([]);
+	});
+
 	it("resumes an interrupted task under the original run id", async () => {
 		setContextWindow("mock/task-resume", 100_000);
 		const storage = memoryStorage();
@@ -510,7 +548,7 @@ describe("validated tasks", () => {
 			type: "step",
 			at: "t1",
 			runId: "r-submit",
-			messages: [
+			messages: stored(
 				{
 					role: "assistant",
 					content: [
@@ -533,7 +571,7 @@ describe("validated tasks", () => {
 						},
 					],
 				},
-			],
+			),
 			inputQueueIds: [],
 			finishReason: "tool-calls",
 			usage: usage(),
@@ -586,7 +624,7 @@ describe("validated tasks", () => {
 			type: "step",
 			at: "t1",
 			runId: "r-cancel",
-			messages: [
+			messages: stored(
 				{
 					role: "assistant",
 					content: [
@@ -609,7 +647,7 @@ describe("validated tasks", () => {
 						},
 					],
 				},
-			],
+			),
 			inputQueueIds: [],
 			finishReason: "tool-calls",
 			usage: usage(),
@@ -1195,12 +1233,17 @@ describe("explicit cancellation durability", () => {
 		const step = events.find(
 			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
 		);
-		expect(step?.messages.map((message) => message.role)).toEqual(["assistant", "tool"]);
+		expect(step?.messages.map((entry) => entry.message.role)).toEqual(["assistant", "tool"]);
+		expect(step?.messages.every((entry) => typeof entry.id === "string")).toBe(true);
 		expect(JSON.stringify(step?.messages)).toContain("lookup-interrupted");
 		expect(JSON.stringify(step?.messages)).toContain("run was cancelled");
 		const replayed = replaySession(events);
 		expect(replayed.repaired).toBe(0);
-		expect(replayed.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"]);
+		expect(replayed.messages.map((entry) => entry.message.role)).toEqual([
+			"user",
+			"assistant",
+			"tool",
+		]);
 	});
 
 	it("does not promote a preliminary tool result to a final result on cancellation", async () => {
@@ -1673,7 +1716,7 @@ describe("explicit cancellation durability", () => {
 			type: "step",
 			at: "t2",
 			runId: "cancelled-run",
-			messages: [{ role: "assistant", content: "kept" }],
+			messages: stored({ role: "assistant", content: "kept" }),
 			inputQueueIds: [],
 			acknowledgesInput: true,
 			finishReason: "cancelled",
@@ -1731,7 +1774,7 @@ describe("explicit cancellation durability", () => {
 			type: "step",
 			at: "t2",
 			runId: "cancelled-task-run",
-			messages: [{ role: "assistant", content: "partial task work" }],
+			messages: stored({ role: "assistant", content: "partial task work" }),
 			inputQueueIds: [],
 			acknowledgesInput: true,
 			finishReason: "cancelled",
@@ -1887,7 +1930,7 @@ describe("compaction with pending inputs", () => {
 			type: "step",
 			at: "t1",
 			runId: "old",
-			messages: [{ role: "assistant", content: "old answer" }],
+			messages: stored({ role: "assistant", content: "old answer" }),
 			inputQueueIds: [],
 			finishReason: "stop",
 			usage: usage({ inputTokens: 60, outputTokens: 20, totalTokens: 80 }),
@@ -1922,12 +1965,24 @@ describe("compaction with pending inputs", () => {
 		const compaction = events.find(
 			(event): event is Extract<StoredEvent, { type: "compaction" }> => event.type === "compaction",
 		);
-		expect(compaction?.pendingInputs).toEqual([{ pendingIndex: 0, messageIndex: 1 }]);
+		if (queued) {
+			// The queued input has a ledger id (its queueId), so replay re-links it
+			// by id — no legacy index pair is written.
+			expect(compaction?.pendingInputs).toBeUndefined();
+			expect(
+				compaction?.messages.find((entry) =>
+					JSON.stringify(entry.message.content).includes("current question"),
+				)?.id,
+			).toBe("q-current");
+		} else {
+			// A pre-v0.7 id-less pending input still gets the legacy index pair.
+			expect(compaction?.pendingInputs).toEqual([{ pendingIndex: 0, messageIndex: 1 }]);
+		}
 		const replayed = replaySession(events);
 		expect(replayed.pendingMessages).toBe(0);
 		expect(
-			replayed.messages.filter((message) =>
-				JSON.stringify(message.content).includes("current question"),
+			replayed.messages.filter((entry) =>
+				JSON.stringify(entry.message.content).includes("current question"),
 			),
 		).toHaveLength(1);
 		const finalStep = [...events]
@@ -1950,7 +2005,7 @@ describe("compaction with pending inputs", () => {
 			type: "step",
 			at: "t1",
 			runId: "old",
-			messages: [{ role: "assistant", content: "old answer" }],
+			messages: stored({ role: "assistant", content: "old answer" }),
 			inputQueueIds: [],
 			finishReason: "stop",
 			usage: usage({ inputTokens: 10, outputTokens: 5, totalTokens: 15 }),
@@ -1997,8 +2052,8 @@ describe("compaction with pending inputs", () => {
 		expect(streamCall).toBe(2);
 		const replayed = replaySession(await storage.load(sessionId));
 		expect(
-			replayed.messages.filter((message) =>
-				JSON.stringify(message.content).includes("current forced question"),
+			replayed.messages.filter((entry) =>
+				JSON.stringify(entry.message.content).includes("current forced question"),
 			),
 		).toHaveLength(1);
 	});
@@ -2017,7 +2072,7 @@ describe("compaction with pending inputs", () => {
 			type: "step",
 			at: "t1",
 			runId: "old",
-			messages: [{ role: "assistant", content: "old answer" }],
+			messages: stored({ role: "assistant", content: "old answer" }),
 			inputQueueIds: [],
 			finishReason: "stop",
 			usage: usage({ inputTokens: 60, outputTokens: 20, totalTokens: 80 }),
@@ -2326,7 +2381,7 @@ describe("message queueing", () => {
 		// and the whole thing replays with nothing pending
 		const finalReplay = replaySession(events);
 		expect(finalReplay.pendingMessages).toBe(0);
-		expect(finalReplay.messages.map((message) => message.role)).toEqual([
+		expect(finalReplay.messages.map((entry) => entry.message.role)).toEqual([
 			"user",
 			"assistant",
 			"user",
@@ -2968,7 +3023,7 @@ describe("message queueing", () => {
 			type: "step",
 			at: "t3",
 			runId: "r1",
-			messages: [{ role: "assistant", content: "answer to A" }],
+			messages: stored({ role: "assistant", content: "answer to A" }),
 			inputQueueIds: [],
 			finishReason: "stop",
 			usage: usage(),
@@ -3187,7 +3242,7 @@ describe("crash-window finalization", () => {
 			type: "step",
 			at: "t2",
 			runId: "r1",
-			messages: [{ role: "assistant", content: "answer to A" }],
+			messages: stored({ role: "assistant", content: "answer to A" }),
 			inputQueueIds: [],
 			finishReason,
 			usage: usage(),
@@ -3237,7 +3292,7 @@ describe("crash-window finalization", () => {
 			type: "step",
 			at: "t2",
 			runId: "old-run",
-			messages: [{ role: "assistant", content: "stale old answer" }],
+			messages: stored({ role: "assistant", content: "stale old answer" }),
 			inputQueueIds: [],
 			finishReason: "stop",
 			usage: usage(),
@@ -3263,7 +3318,7 @@ describe("crash-window finalization", () => {
 			type: "step",
 			at: "t6",
 			runId: "current-run",
-			messages: [{ role: "assistant", content: "" }],
+			messages: stored({ role: "assistant", content: "" }),
 			inputQueueIds: [],
 			finishReason: "stop",
 			usage: usage(),
@@ -3349,7 +3404,7 @@ describe("crash-window finalization", () => {
 		const events = await storage.load("send-after-finalize");
 		expect(events.filter((event) => event.type === "run-start")).toHaveLength(2);
 		expect(events.filter((event) => event.type === "run-end")).toHaveLength(2);
-		expect(replaySession(events).messages.map((message) => message.role)).toEqual([
+		expect(replaySession(events).messages.map((entry) => entry.message.role)).toEqual([
 			"user",
 			"assistant",
 			"user",
@@ -3479,7 +3534,7 @@ describe("auto-resume", () => {
 			type: "step",
 			at: "t2",
 			runId: "r1",
-			messages: [{ role: "assistant", content: "one…" }],
+			messages: stored({ role: "assistant", content: "one…" }),
 			finishReason: "tool-calls",
 			usage: usage(),
 		});
@@ -3797,5 +3852,181 @@ describe("auto-resume", () => {
 		await expect(agentic.resumeInterrupted()).rejects.toThrow(
 			"autoResume.maxConcurrent must be a positive integer",
 		);
+	});
+});
+
+describe("message identity", () => {
+	const finishPart: LanguageModelV3StreamPart = {
+		type: "finish",
+		finishReason: { unified: "stop", raw: "stop" },
+		usage: {
+			inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+			outputTokens: { total: 5, text: 5, reasoning: undefined },
+		},
+	};
+	const textStream = (text: string) =>
+		convertArrayToReadableStream<LanguageModelV3StreamPart>([
+			{ type: "stream-start", warnings: [] },
+			{ type: "text-start", id: "1" },
+			{ type: "text-delta", id: "1", delta: text },
+			{ type: "text-end", id: "1" },
+			finishPart,
+		]);
+
+	it("mints ids and timestamps for every message, stable across replays", async () => {
+		setContextWindow("mock/identity", 100_000);
+		const storage = memoryStorage();
+		const model = new MockLanguageModelV3({
+			doStream: async () => ({ stream: textStream("hi there") }),
+		});
+		const events: AgenticEvent[] = [];
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+			onEvent: (event) => events.push(event),
+		});
+		const session = agentic.session("identity", { model: "mock/identity" });
+		const result = await session.send("hello");
+
+		const messages = await session.messages();
+		expect(messages.map((entry) => entry.message.role)).toEqual(["user", "assistant"]);
+		for (const entry of messages) {
+			expect(typeof entry.id).toBe("string");
+			expect(entry.at.length).toBeGreaterThan(0);
+		}
+		expect(new Set(messages.map((entry) => entry.id)).size).toBe(2);
+
+		// The ledger carries the same identities, on the event for user input and
+		// per stored message for model output.
+		const ledger = await storage.load("identity");
+		const userEvent = ledger.find(
+			(event): event is Extract<StoredEvent, { type: "user-message" }> =>
+				event.type === "user-message",
+		);
+		expect(userEvent?.id).toBe(messages[0].id);
+		expect(messages[0].at).toBe(userEvent?.at);
+		const stepEvent = ledger.find(
+			(event): event is Extract<StoredEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(stepEvent?.messages.map((entry) => entry.id)).toEqual([messages[1].id]);
+		expect(messages[1].at).toBe(stepEvent?.at);
+
+		// The RunResult names the run that produced it, closing the correlation
+		// loop: result → run events → step messages.
+		expect(typeof result.runId).toBe("string");
+		expect(result.runId).toBe(stepEvent?.runId);
+
+		// Replay is deterministic: same ids every load.
+		expect((await session.messages()).map((entry) => entry.id)).toEqual(
+			messages.map((entry) => entry.id),
+		);
+
+		// Live events are stamped, and the step event carries the persisted
+		// identified messages.
+		expect(events.length).toBeGreaterThan(0);
+		expect(events.every((event) => typeof event.at === "string" && event.at.length > 0)).toBe(true);
+		const liveStep = events.find(
+			(event): event is Extract<AgenticEvent, { type: "step" }> => event.type === "step",
+		);
+		expect(liveStep?.messages.map((entry) => entry.id)).toEqual([messages[1].id]);
+	});
+
+	it("replays a pre-v0.7 ledger: null ids for plain messages, inputId honored", () => {
+		const legacyStep = {
+			type: "step",
+			at: "t1",
+			runId: "r1",
+			messages: [{ role: "assistant", content: "old" }],
+			finishReason: "stop",
+			usage: usage(),
+		} as unknown as StoredEvent;
+		const replayed = replaySession([
+			{
+				type: "user-message",
+				at: "t0",
+				message: { role: "user", content: "hi" },
+				inputId: "legacy-input",
+			},
+			{ type: "run-start", at: "t0", runId: "r1", model: "m" },
+			legacyStep,
+			{ type: "run-end", at: "t2", runId: "r1", status: "completed" },
+		]);
+		expect(replayed.messages.map((entry) => entry.id)).toEqual(["legacy-input", null]);
+		expect(replayed.messages.map((entry) => entry.at)).toEqual(["t0", "t1"]);
+		expect(replayed.messages.map((entry) => entry.message.content)).toEqual(["hi", "old"]);
+	});
+
+	it("keeps retained ids and times across compaction; the summary gets a fresh id", async () => {
+		const modelId = "mock/identity-compaction";
+		setContextWindow(modelId, 100);
+		const storage = memoryStorage();
+		const sessionId = "identity-compaction";
+		await storage.append(sessionId, {
+			type: "user-message",
+			at: "t0",
+			id: "u-old",
+			message: { role: "user", content: "old question" },
+		});
+		await storage.append(sessionId, {
+			type: "step",
+			at: "t1",
+			runId: "old",
+			messages: [{ id: "a-old", message: { role: "assistant", content: "old answer" } }],
+			inputQueueIds: [],
+			finishReason: "stop",
+			usage: usage({ inputTokens: 60, outputTokens: 20, totalTokens: 80 }),
+		});
+		await storage.append(sessionId, {
+			type: "run-end",
+			at: "t2",
+			runId: "old",
+			status: "completed",
+		});
+		await storage.append(sessionId, {
+			type: "user-message",
+			at: "t3",
+			id: "u-current",
+			message: { role: "user", content: "current question" },
+		});
+		const model = new MockLanguageModelV3({
+			doGenerate: async () => ({
+				content: [{ type: "text" as const, text: "summary of old q&a" }],
+				finishReason: { unified: "stop" as const, raw: "stop" },
+				usage: {
+					inputTokens: { total: 10, noCache: 10, cacheRead: undefined, cacheWrite: undefined },
+					outputTokens: { total: 5, text: 5, reasoning: undefined },
+				},
+				warnings: [],
+			}),
+			doStream: async () => ({ stream: textStream("current answer") }),
+		});
+
+		await expect(
+			runLoop({
+				sessionId,
+				agent: { model: modelId, compaction: { limit: 0.5, keepRecent: 0 } },
+				storage,
+				getModel: () => model,
+			}),
+		).resolves.toMatchObject({ status: "completed", text: "current answer" });
+
+		const events = await storage.load(sessionId);
+		const compaction = events.find(
+			(event): event is Extract<StoredEvent, { type: "compaction" }> => event.type === "compaction",
+		);
+		// The pending input survives the rebase with its exact identity — id AND
+		// original persist time — while the fresh summary message gets a new id.
+		const summaryEntry = compaction?.messages[0];
+		const retainedEntry = compaction?.messages.find((entry) => entry.id === "u-current");
+		expect(retainedEntry?.at).toBe("t3");
+		expect(typeof summaryEntry?.id).toBe("string");
+		expect(["u-old", "a-old", "u-current"]).not.toContain(summaryEntry?.id);
+		expect(compaction?.pendingInputs).toBeUndefined();
+
+		const replayed = replaySession(events);
+		expect(replayed.pendingMessages).toBe(0);
+		const current = replayed.messages.find((entry) => entry.id === "u-current");
+		expect(current?.at).toBe("t3");
+		expect(JSON.stringify(current?.message.content)).toContain("current question");
 	});
 });

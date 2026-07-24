@@ -96,6 +96,40 @@ the message in. Key invariants, in `src/run.ts`:
   collapse into one automatically started successor run, and—once that
   successor is running—can be stopped by a subsequent `cancel()`.
 
+### Message identity (v0.7)
+
+Everything in the event stream is covered by ids, minted once at append time
+and paired with timestamps:
+
+- User messages carry `id` on their `user-message` event (for queued sends it
+  equals `meta.queueId`; pokes and task prompts get ids too). `inputId` is the
+  legacy pre-v0.7 name, still read on replay.
+- Assistant/tool messages are persisted as `StoredMessage` envelopes
+  (`{ id, message }`) inside `step` and `compaction` events; tool calls keep
+  the AI SDK's `toolCallId` within content.
+- Replay returns `SessionMessage` (`{ id, at, message }`) from
+  `session.messages()` / `replaySession().messages` — `at` is the persisting
+  event's time. Identity survives compaction: a retained tail message keeps
+  its original id and `at` in the rebased base (per-message `at` on the
+  compaction envelope), and replay re-links pending inputs by id, replacing
+  the legacy `pendingInputs` index pairs (still read, only written for id-less
+  legacy pending inputs). Internally replay threads ids through
+  `sanitizeConversation` via symbol tags so clone-on-repair keeps them.
+- Live `AgenticEvent`s all carry `at`; the live `step` event includes the
+  persisted `StoredMessage[]`, and `queued-message`/`poke` carry `messageId`.
+- Steps also carry `inputMessageIds`, the complete durable input membership for
+  that model pass. `projectRun(events, runId)` turns those memberships into
+  causal response segments for database/UI adapters; app code should not parse
+  queue markers or infer turns from append order.
+- `RunResult.runId` names the run that produced the result (for a queued send
+  answered by another run, the run that causally answered it).
+- Pre-v0.7 ledgers replay fine (plain messages ⇒ `id: null`); pre-v0.7 *code*
+  cannot read v0.7 ledgers — that direction is the breaking change.
+
+`task({ durable: false })` runs against an isolated in-memory ledger. Use it
+for disposable presentation work that needs task validation/retries but should
+not create a recoverable session in the configured storage.
+
 ### Auto-resume (the boot sweep)
 
 `createAgentic({ autoResume: (sessionId) => agentConfig })` makes crash

@@ -35,7 +35,7 @@ const result = await session.send("What is my dog's name and my favorite number?
 console.log(`\nFINAL ANSWER: ${result.text}`);
 const messages = await session.messages();
 console.log(`replayed message count after compaction: ${messages.length}`);
-const first = messages[0];
+const first = messages[0].message;
 const preview = typeof first.content === "string" ? first.content : JSON.stringify(first.content);
 console.log(`first replayed message starts with: ${preview.slice(0, 120)}...`);
 const ok = /biscuit/i.test(result.text) && /42/.test(result.text);

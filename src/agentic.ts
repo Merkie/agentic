@@ -6,15 +6,16 @@ import { classifyFailure, serializeError } from "./failure.js";
 import { logEvents } from "./logEvents.js";
 import { getContextWindow } from "./modelMeta.js";
 import { createOpenRouter } from "./openrouter.js";
-import { type ReplayedSession, replaySession } from "./replay.js";
+import { normalizeStoredMessages, type ReplayedSession, replaySession } from "./replay.js";
 import { createResilientFetch, type ResilientFetchOptions } from "./resilientFetch.js";
 import { createMailbox, type RunLoopOptions, runLoop } from "./run.js";
-import { fileStorage, serializedStorage } from "./storage.js";
+import { fileStorage, memoryStorage, serializedStorage } from "./storage.js";
 import type {
 	AgentConfig,
 	EventListener,
 	MaybePromise,
 	RunResult,
+	SessionMessage,
 	StorageProvider,
 	StoredEvent,
 	TaskOutcome,
@@ -121,8 +122,11 @@ export interface Session<TOOLS extends ToolSet = ToolSet> {
 	 * null when there is nothing to resume.
 	 */
 	resume(options?: Pick<SendOptions<TOOLS>, "onPart" | "abortSignal">): Promise<RunResult | null>;
-	/** The replay-ready conversation as the model would see it. */
-	messages(): Promise<ModelMessage[]>;
+	/**
+	 * The replay-ready conversation as the model would see it, each message
+	 * carrying its durable ledger id and persist time.
+	 */
+	messages(): Promise<SessionMessage[]>;
 	/** Lifetime usage/cost totals plus current context pressure. */
 	stats(): Promise<UsageTotals>;
 	/** True when a run was interrupted and resume() would do work. */
@@ -141,6 +145,12 @@ export interface TaskOptions<T, TOOLS extends ToolSet = ToolSet> {
 	deliverable?: ZodType<T>;
 	/** Session id — pass one to make the task resumable/auditable by name. */
 	id?: string;
+	/**
+	 * Persist this task in the configured ledger. Set false for presentation
+	 * helpers and other one-shot work that should not create a recoverable
+	 * session. Defaults true.
+	 */
+	durable?: boolean;
 	/** Extra instructions appended to the submit tool's description. */
 	deliverableHint?: string;
 	maxPokes?: number;
@@ -252,6 +262,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		>,
 		mailbox = createMailbox(),
 		controller = new AbortController(),
+		runStorage: StorageProvider = storage,
 	): Promise<RunResult> {
 		const initiatingSignal = runOptions.abortSignal;
 		let detachAbortListener: (() => void) | undefined;
@@ -272,7 +283,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		const result = runLoop<TOOLS>({
 			sessionId,
 			agent,
-			storage,
+			storage: runStorage,
 			getModel,
 			emit: emitEvent,
 			mailbox,
@@ -302,6 +313,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		agent: AgentConfig<TOOLS>,
 		events: StoredEvent[],
 		replayed: ReplayedSession,
+		runStorage: StorageProvider = storage,
 	): Promise<RunResult | null> {
 		const runId = replayed.interruptedRunId;
 		if (!runId) return null;
@@ -312,7 +324,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		const status = interrupted?.interrupted?.status ?? "completed";
 		const error = interrupted?.interrupted?.error;
 
-		await storage.append(sessionId, {
+		await runStorage.append(sessionId, {
 			type: "run-end",
 			at: new Date().toISOString(),
 			runId,
@@ -324,9 +336,18 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			...replayed.totals,
 			contextWindow: await getContextWindow(agent.model),
 		};
-		emitEvent({ type: "run-end", sessionId, runId, status, totals, ...(error ? { error } : {}) });
+		emitEvent({
+			type: "run-end",
+			at: new Date().toISOString(),
+			sessionId,
+			runId,
+			status,
+			totals,
+			...(error ? { error } : {}),
+		});
 		return {
 			status,
+			runId,
 			text: lastAssistantTextForRun(events, runId),
 			totals,
 			...(error ? { error } : {}),
@@ -440,6 +461,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						// result; a tool-call step followed by failure is not completion.
 						return {
 							status: terminal.status,
+							runId: answeredRunId,
 							text: lastAssistantTextForRun(events, answeredRunId),
 							totals: {
 								...replayed.totals,
@@ -485,7 +507,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 								type: "user-message",
 								at: new Date().toISOString(),
 								message,
-								inputId: queueId,
+								id: queueId,
 								meta: { ...sendOptions.meta, queued: true, queueId },
 							});
 						} catch (error) {
@@ -500,7 +522,13 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 							});
 						}
 						if (live.mailbox.tryEnqueue(queueId)) {
-							emitEvent({ type: "queued-message", sessionId: id, runId: live.mailbox.runId });
+							emitEvent({
+								type: "queued-message",
+								at: new Date().toISOString(),
+								sessionId: id,
+								runId: live.mailbox.runId,
+								messageId: queueId,
+							});
 							return finishQueuedSend(queueId, live, sendOptions);
 						}
 						// The run committed to ending while the append settled. Await it,
@@ -522,13 +550,13 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					});
 					void liveResult.catch(() => {});
 					liveRuns.set(id, { mailbox, result: liveResult, controller });
-					const inputId = newId();
+					const messageId = newId();
 					const initialAppend = Promise.resolve(
 						storage.append(id, {
 							type: "user-message",
 							at: new Date().toISOString(),
 							message,
-							inputId,
+							id: messageId,
 							meta: sendOptions.meta,
 						}),
 					);
@@ -536,7 +564,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						await initialAppend;
 						const events = await storage.load(id);
 						const inputIndex = events.findIndex(
-							(event) => event.type === "user-message" && event.inputId === inputId,
+							(event) => event.type === "user-message" && event.id === messageId,
 						);
 						const priorEvents = inputIndex >= 0 ? events.slice(0, inputIndex) : events;
 						const prior = replaySession(priorEvents);
@@ -580,6 +608,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						type: "user-message",
 						at: new Date().toISOString(),
 						message,
+						id: newId(),
 						meta: sendOptions.meta,
 					});
 					if (prior.interruptedRunId && !finalized) {
@@ -641,6 +670,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		taskOptions: TaskOptions<T, TOOLS>,
 	): Promise<TaskOutcome<T>> {
 		const sessionId = taskOptions.id ?? `task-${newId()}`;
+		const taskStorage = taskOptions.durable === false ? memoryStorage() : storage;
 		const schema = taskOptions.deliverable;
 
 		let settled: TaskOutcome<T> | null = null;
@@ -739,15 +769,19 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		return withSessionLock(sessionId, async () => {
 			// A resumed task may already be settled in its persisted history
 			// (process died between the terminal tool running and run-end).
-			const priorEvents = await storage.load(sessionId);
+			const priorEvents = await taskStorage.load(sessionId);
 			const prior = replaySession(priorEvents);
-			const priorOutcome = findSettledOutcome<T>(prior.messages, schema, sessionId);
+			const priorOutcome = findSettledOutcome<T>(
+				prior.messages.map((entry) => entry.message),
+				schema,
+				sessionId,
+			);
 			if (priorOutcome) {
 				if (prior.interruptedRunId) {
 					const status = priorOutcome.status === "cancelled" ? "cancelled" : "completed";
 					const error =
 						priorOutcome.status === "cancelled" ? serializeError(priorOutcome.reason) : undefined;
-					await storage.append(sessionId, {
+					await taskStorage.append(sessionId, {
 						type: "run-end",
 						at: new Date().toISOString(),
 						runId: prior.interruptedRunId,
@@ -756,6 +790,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					});
 					emitEvent({
 						type: "run-end",
+						at: new Date().toISOString(),
 						sessionId,
 						runId: prior.interruptedRunId,
 						status,
@@ -775,7 +810,13 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				};
 			}
 			if (prior.interruptedRunId && interruptedStepForRun(priorEvents, prior.interruptedRunId)) {
-				const finalized = await finalizePersistedRun(sessionId, agent, priorEvents, prior);
+				const finalized = await finalizePersistedRun(
+					sessionId,
+					agent,
+					priorEvents,
+					prior,
+					taskStorage,
+				);
 				if (finalized?.status === "cancelled") {
 					return {
 						status: "cancelled",
@@ -792,28 +833,36 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						? [toUserMessage(taskOptions.prompt)]
 						: taskOptions.prompt;
 				for (const message of prompts) {
-					await storage.append(sessionId, {
+					await taskStorage.append(sessionId, {
 						type: "user-message",
 						at: new Date().toISOString(),
 						message,
+						id: newId(),
 					});
 				}
 			}
 			if (prior.interruptedRunId) {
-				await storage.append(sessionId, {
+				await taskStorage.append(sessionId, {
 					type: "run-resume",
 					at: new Date().toISOString(),
 					runId: prior.interruptedRunId,
 				});
 			}
 
-			const result = await execRun<ToolSet>(sessionId, agent, {
-				abortSignal: taskOptions.abortSignal,
-				onPart: taskOptions.onPart as (part: TextStreamPart<ToolSet>) => void,
-				isSettled: () => settled !== null,
-				maxPokes: taskOptions.maxPokes ?? 2,
-				resumeRunId: prior.interruptedRunId ?? undefined,
-			});
+			const result = await execRun<ToolSet>(
+				sessionId,
+				agent,
+				{
+					abortSignal: taskOptions.abortSignal,
+					onPart: taskOptions.onPart as (part: TextStreamPart<ToolSet>) => void,
+					isSettled: () => settled !== null,
+					maxPokes: taskOptions.maxPokes ?? 2,
+					resumeRunId: prior.interruptedRunId ?? undefined,
+				},
+				undefined,
+				undefined,
+				taskStorage,
+			);
 
 			if (settled) {
 				const outcome = settled as TaskOutcome<T>;
@@ -884,6 +933,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					if (currentAttempt <= maxAttempts) return;
 					emitEvent({
 						type: "auto-resume",
+						at: new Date().toISOString(),
 						sessionId: id,
 						runId: current.interruptedRunId,
 						attempt: currentAttempt,
@@ -901,6 +951,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					});
 					emitEvent({
 						type: "run-end",
+						at: new Date().toISOString(),
 						sessionId: id,
 						runId: current.interruptedRunId,
 						status: "failed",
@@ -922,6 +973,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			}
 			emitEvent({
 				type: "auto-resume",
+				at: new Date().toISOString(),
 				sessionId: id,
 				runId: replayed.interruptedRunId,
 				attempt,
@@ -1026,7 +1078,9 @@ function terminalEventForRun(
 function lastAssistantTextForRun(events: StoredEvent[], runId: string): string {
 	return lastAssistantText(
 		events.flatMap((event) =>
-			event.type === "step" && event.runId === runId ? event.messages : [],
+			event.type === "step" && event.runId === runId
+				? normalizeStoredMessages(event.messages, event.at).map((stored) => stored.message)
+				: [],
 		),
 	);
 }

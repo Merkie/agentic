@@ -28,7 +28,14 @@ export {
 	type OpenRouterProvider,
 	type OpenRouterProviderSettings,
 } from "./openrouter.js";
-export { type ReplayedSession, replaySession } from "./replay.js";
+export {
+	type ProjectedInput,
+	type ProjectedRun,
+	type ProjectedRunSegment,
+	projectRun,
+	type RunProjectionStatus,
+} from "./projection.js";
+export { normalizeStoredMessages, type ReplayedSession, replaySession } from "./replay.js";
 export {
 	createResilientFetch,
 	HeaderTimeoutError,
@@ -51,9 +58,11 @@ export type {
 	RetryConfig,
 	RunResult,
 	SerializedError,
+	SessionMessage,
 	StepUsage,
 	StorageProvider,
 	StoredEvent,
+	StoredMessage,
 	TaskOutcome,
 	UsageTotals,
 } from "./types.js";

@@ -19,9 +19,11 @@ import type {
 	AgenticEvent,
 	EventListener,
 	RunResult,
+	SessionMessage,
 	StepUsage,
 	StorageProvider,
 	StoredEvent,
+	StoredMessage,
 	UsageTotals,
 } from "./types.js";
 import { addStepToTotals, contextTokensOf, emptyTotals, extractStepUsage } from "./usage.js";
@@ -121,8 +123,8 @@ export function hoistSandwichedUsers(messages: ModelMessage[], max: number): voi
 	messages.push(...queued);
 }
 
-function hoistPendingInputs(messages: ModelMessage[], pending: ModelMessage[]): void {
-	const actionable: ModelMessage[] = [];
+function hoistPendingInputs(messages: SessionMessage[], pending: SessionMessage[]): void {
+	const actionable: SessionMessage[] = [];
 	for (const message of pending) {
 		const index = messages.indexOf(message);
 		if (index >= 0) messages.splice(index, 1);
@@ -161,6 +163,17 @@ export interface RunLoopOptions<TOOLS extends ToolSet = ToolSet> {
 
 function newId(): string {
 	return globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+}
+
+/** An AgenticEvent as constructed at an emit site — the wrapper stamps `at`. */
+type EmittableEvent = AgenticEvent extends infer E
+	? E extends AgenticEvent
+		? Omit<E, "at">
+		: never
+	: never;
+
+function storeMessages(messages: ModelMessage[]): StoredMessage[] {
+	return messages.map((message) => ({ id: newId(), message }));
 }
 
 function now(): string {
@@ -408,9 +421,11 @@ export async function runLoop<TOOLS extends ToolSet>(
 				})
 			: agent.tools;
 
-	const emit = (event: AgenticEvent) => {
+	// Every live event is stamped with its emit time here, so construction
+	// sites carry only their own payload.
+	const emit = (event: EmittableEvent) => {
 		try {
-			options.emit?.(event);
+			options.emit?.({ ...event, at: now() } as AgenticEvent);
 		} catch {
 			// a broken listener must never kill a run
 		}
@@ -427,6 +442,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 	let pokes = 0;
 	let forceCompact = false;
 	let currentInputQueueIds: string[] = [];
+	let currentInputMessageIds: string[] = [];
 	// Progress since the last forced compaction — if a context-overflow error
 	// recurs with no new steps in between, compaction cannot save this run.
 	let progressSinceForcedCompaction = true;
@@ -437,7 +453,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		const serialized = serializeError(error);
 		await append({ type: "run-end", at: now(), runId, status: "failed", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "failed", totals, error: serialized });
-		return { status: "failed", text: finalText, totals, error: serialized };
+		return { status: "failed", runId, text: finalText, totals, error: serialized };
 	};
 
 	const cancel = async (
@@ -454,14 +470,18 @@ export async function runLoop<TOOLS extends ToolSet>(
 		}
 		if (runStarted) {
 			const usage = unknownStepUsage();
+			const stored = storeMessages(
+				agent.preserveProviderOptions
+					? (partial?.messages ?? [])
+					: stripProviderOptions(partial?.messages ?? []),
+			);
 			try {
 				await append({
 					type: "step",
 					at: now(),
 					runId,
-					messages: agent.preserveProviderOptions
-						? (partial?.messages ?? [])
-						: stripProviderOptions(partial?.messages ?? []),
+					messages: stored,
+					...(currentInputMessageIds.length > 0 ? { inputMessageIds: currentInputMessageIds } : {}),
 					inputQueueIds: currentInputQueueIds,
 					acknowledgesInput: true,
 					finishReason: "cancelled",
@@ -480,6 +500,8 @@ export async function runLoop<TOOLS extends ToolSet>(
 				runId,
 				finishReason: "cancelled",
 				usage,
+				messages: stored,
+				...(currentInputMessageIds.length > 0 ? { inputMessageIds: currentInputMessageIds } : {}),
 				toolCalls: (partial?.toolCalls ?? []).map((call) => ({
 					toolName: call.toolName,
 					input: call.input,
@@ -487,10 +509,11 @@ export async function runLoop<TOOLS extends ToolSet>(
 				text: partial?.text ?? "",
 			});
 			currentInputQueueIds = [];
+			currentInputMessageIds = [];
 		}
 		await append({ type: "run-end", at: now(), runId, status: "cancelled", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "cancelled", totals, error: serialized });
-		return { status: "cancelled", text: finalText, totals, error: serialized };
+		return { status: "cancelled", runId, text: finalText, totals, error: serialized };
 	};
 
 	// Summarize-and-rebase the session. "skip" = nothing left to compact away.
@@ -514,22 +537,39 @@ export async function runLoop<TOOLS extends ToolSet>(
 		}
 		try {
 			const compacted = await runCompaction({
-				messages: replayed.messages,
+				messages: replayed.messages.map((entry) => entry.message),
 				model: options.getModel(compaction.model ?? agent.model, agent),
 				config: compactionForPass,
 				abortSignal: options.abortSignal,
 			});
-			const pendingInputs = replayed.pendingInputMessages.flatMap((message, pendingIndex) => {
-				const messageIndex = compacted.messages.indexOf(message);
+			// Identity continuity: a message retained in the base keeps its ledger
+			// id and original persist time; only the summary gets a fresh id.
+			const identityOf = new Map<ModelMessage, SessionMessage>();
+			for (const entry of replayed.messages) identityOf.set(entry.message, entry);
+			const persisted = agent.preserveProviderOptions
+				? compacted.messages
+				: stripProviderOptions(compacted.messages);
+			const compactedAt = now();
+			const stored: StoredMessage[] = persisted.map((message, index) => {
+				const prior = identityOf.get(compacted.messages[index]);
+				return {
+					id: prior?.id ?? newId(),
+					at: prior?.at ? prior.at : compactedAt,
+					message,
+				};
+			});
+			// A pending input replayed from a pre-v0.7 ledger has no id for replay
+			// to re-link by; record the legacy index pair for those only.
+			const pendingInputs = replayed.pendingInputMessages.flatMap((entry, pendingIndex) => {
+				if (entry.id !== null) return [];
+				const messageIndex = compacted.messages.indexOf(entry.message);
 				return messageIndex >= 0 ? [{ pendingIndex, messageIndex }] : [];
 			});
 			await append({
 				type: "compaction",
-				at: now(),
-				messages: agent.preserveProviderOptions
-					? compacted.messages
-					: stripProviderOptions(compacted.messages),
-				pendingInputs,
+				at: compactedAt,
+				messages: stored,
+				...(pendingInputs.length > 0 ? { pendingInputs } : {}),
 				usage: compacted.usage,
 			});
 			// cost counts; the summarizer's context size is not the live chat's
@@ -551,11 +591,15 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// particular, pre-pass compaction can be aborted before the model that
 		// answers these inputs is ever called.
 		currentInputQueueIds = [];
+		currentInputMessageIds = [];
 		if (options.abortSignal?.aborted) return cancel(options.abortSignal.reason);
 
 		const events = await storage.load(sessionId);
 		const replayed = replaySession(events);
 		const inputQueueIds = replayed.pendingQueueIds;
+		const inputMessageIds = replayed.pendingInputMessages.flatMap((entry) =>
+			entry.id === null ? [] : [entry.id],
+		);
 		if (replayed.pendingMessages > 0) {
 			hoistPendingInputs(replayed.messages, replayed.pendingInputMessages);
 		}
@@ -632,6 +676,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		let lastFinishReason = "";
 		let streamError: unknown;
 		let queueIdsForNextStep = inputQueueIds;
+		let messageIdsForNextStep = inputMessageIds;
 		const partialStep = emptyPartialStepCapture();
 		// onStepFinish persistence is async; every pending append must settle
 		// before the next pass replays the session, or the replay races the
@@ -643,10 +688,11 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// before streamText is actually entered.
 		if (options.abortSignal?.aborted) return cancel(options.abortSignal.reason);
 		currentInputQueueIds = inputQueueIds;
+		currentInputMessageIds = inputMessageIds;
 		const result = streamText({
 			model: options.getModel(agent.model, agent),
 			system: agent.system,
-			messages: replayed.messages,
+			messages: replayed.messages.map((entry) => entry.message),
 			tools,
 			toolChoice: agent.toolChoice,
 			abortSignal: options.abortSignal,
@@ -676,19 +722,24 @@ export async function runLoop<TOOLS extends ToolSet>(
 				const newMessages = step.response.messages.slice();
 				const acknowledgesInput = step.finishReason !== "error" && newMessages.length > 0;
 				const stepInputQueueIds = queueIdsForNextStep;
+				const stepInputMessageIds = messageIdsForNextStep;
 				if (acknowledgesInput) {
 					queueIdsForNextStep = [];
+					messageIdsForNextStep = [];
 					currentInputQueueIds = [];
+					currentInputMessageIds = [];
 				}
+				const stored = storeMessages(
+					agent.preserveProviderOptions ? newMessages : stripProviderOptions(newMessages),
+				);
 				pendingAppends.push(
 					Promise.resolve(
 						append({
 							type: "step",
 							at: now(),
 							runId,
-							messages: agent.preserveProviderOptions
-								? newMessages
-								: stripProviderOptions(newMessages),
+							messages: stored,
+							inputMessageIds: stepInputMessageIds,
 							inputQueueIds: stepInputQueueIds,
 							acknowledgesInput,
 							finishReason: step.finishReason,
@@ -709,6 +760,8 @@ export async function runLoop<TOOLS extends ToolSet>(
 					runId,
 					finishReason: step.finishReason,
 					usage,
+					messages: stored,
+					inputMessageIds: stepInputMessageIds,
 					toolCalls: step.toolCalls.map((t) => ({ toolName: t.toolName, input: t.input })),
 					text: step.text,
 				});
@@ -846,13 +899,15 @@ export async function runLoop<TOOLS extends ToolSet>(
 				);
 			}
 			const content = options.pokeMessage?.(pokes) ?? DEFAULT_POKE(pokes === maxPokes);
+			const pokeMessageId = newId();
 			await append({
 				type: "user-message",
 				at: now(),
+				id: pokeMessageId,
 				message: { role: "user", content },
 				meta: { poke: pokes },
 			});
-			emit({ type: "poke", sessionId, runId, poke: pokes, maxPokes });
+			emit({ type: "poke", sessionId, runId, poke: pokes, maxPokes, messageId: pokeMessageId });
 			continue;
 		}
 
@@ -868,6 +923,6 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// here is non-fatal: the threshold is still crossed, so the next run
 		// retries it.
 		if (compactPending) await compactNow();
-		return { status: "completed", text: finalText, totals };
+		return { status: "completed", runId, text: finalText, totals };
 	}
 }

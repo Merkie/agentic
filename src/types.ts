@@ -50,6 +50,35 @@ export interface SerializedError {
 }
 
 /**
+ * Ledger form of a conversation message: the model-ready payload plus its
+ * framework-generated identity. Ids are minted once, at append time, and are
+ * stable for the life of the session — compaction carries them (and the
+ * original `at`) into the rebased message base unchanged.
+ */
+export interface StoredMessage {
+	id: string;
+	/**
+	 * Original persist time, when it differs from the carrying event's `at`
+	 * (compaction re-bases old messages under a new event). Absent ⇒ the
+	 * event's `at` is the message's time.
+	 */
+	at?: string;
+	message: ModelMessage;
+}
+
+/**
+ * Replayed form of a conversation message: what {@link Session.messages} and
+ * `replaySession().messages` return. `id` is null only for messages replayed
+ * from a pre-v0.7 ledger, which predates message identity.
+ */
+export interface SessionMessage {
+	id: string | null;
+	/** ISO 8601 time the message was persisted. */
+	at: string;
+	message: ModelMessage;
+}
+
+/**
  * The append-only event ledger. One session = one ordered list of events.
  * Replaying the list rebuilds the exact ModelMessage[] the model sees plus
  * run/audit state — this is what makes runs survive process restarts.
@@ -59,7 +88,13 @@ export type StoredEvent =
 			type: "user-message";
 			at: string;
 			message: ModelMessage;
-			/** Framework-generated identity for crash-safe intake ordering. */
+			/**
+			 * Framework-generated message identity. Always written since v0.7;
+			 * optional only so pre-v0.7 ledgers remain readable. For queued sends
+			 * this equals `meta.queueId`.
+			 */
+			id?: string;
+			/** Legacy (pre-v0.7) name of `id` — read on replay, never written. */
 			inputId?: string;
 			/** App-supplied tag (e.g. a poke dedup key); opaque to the framework. */
 			meta?: Record<string, unknown>;
@@ -69,8 +104,20 @@ export type StoredEvent =
 			type: "step";
 			at: string;
 			runId: string;
-			/** The step's response messages (assistant + tool), replay-ready. */
-			messages: ModelMessage[];
+			/**
+			 * The step's response messages (assistant + tool), replay-ready, each
+			 * carrying its minted id. Pre-v0.7 ledgers stored plain ModelMessage
+			 * elements here; replay normalizes both shapes (legacy ⇒ id null).
+			 */
+			messages: StoredMessage[];
+			/**
+			 * Durable ids of the user messages present in the model input that
+			 * produced this step. Unlike the legacy queue-only field below, this
+			 * covers both the initiating input and messages accepted by a live run.
+			 * Projection adapters can use it to reconstruct causal turns without
+			 * reverse-engineering ledger order.
+			 */
+			inputMessageIds?: string[];
 			/**
 			 * Queued user-message ids present in the model input that produced this
 			 * step. An empty array is meaningful: this step did not see a queued
@@ -101,11 +148,17 @@ export type StoredEvent =
 	| {
 			type: "compaction";
 			at: string;
-			/** The new replay base — everything before this event is superseded. */
-			messages: ModelMessage[];
 			/**
-			 * Positions of still-pending queued inputs preserved verbatim in the
-			 * compacted message base. Lets replay retain their exact identity.
+			 * The new replay base — everything before this event is superseded.
+			 * Messages retained from before the compaction keep their original id
+			 * and `at`; the summary message gets a fresh id. Pre-v0.7 ledgers
+			 * stored plain ModelMessage elements (legacy ⇒ id null).
+			 */
+			messages: StoredMessage[];
+			/**
+			 * Legacy (pre-v0.7): positions of still-pending queued inputs preserved
+			 * verbatim in the compacted base. Superseded by message ids, which let
+			 * replay re-link pending inputs directly — read on replay, never written.
 			 */
 			pendingInputs?: Array<{ pendingIndex: number; messageIndex: number }>;
 			usage?: StepUsage;
@@ -211,18 +264,24 @@ export interface AgentConfig<TOOLS extends ToolSet = ToolSet> {
 // ── observability ───────────────────────────────────────────────────────
 
 export type AgenticEvent =
-	| { type: "run-start"; sessionId: string; runId: string; model: string }
+	| { type: "run-start"; at: string; sessionId: string; runId: string; model: string }
 	| {
 			type: "step";
+			at: string;
 			sessionId: string;
 			runId: string;
 			finishReason: string;
 			usage: StepUsage;
+			/** The step's persisted messages with their minted ids — what the ledger recorded. */
+			messages: StoredMessage[];
+			/** User-message ids present in the model input for this persisted step. */
+			inputMessageIds?: string[];
 			toolCalls: { toolName: string; input: unknown }[];
 			text: string;
 	  }
 	| {
 			type: "retry";
+			at: string;
 			sessionId: string;
 			runId: string;
 			attempt: number;
@@ -230,13 +289,36 @@ export type AgenticEvent =
 			delayMs: number;
 			error: SerializedError;
 	  }
-	| { type: "compaction"; sessionId: string; beforeTokens: number | null; summaryChars: number }
-	| { type: "poke"; sessionId: string; runId: string; poke: number; maxPokes: number }
+	| {
+			type: "compaction";
+			at: string;
+			sessionId: string;
+			beforeTokens: number | null;
+			summaryChars: number;
+	  }
+	| {
+			type: "poke";
+			at: string;
+			sessionId: string;
+			runId: string;
+			poke: number;
+			maxPokes: number;
+			/** Id of the poke user-message appended to the ledger. */
+			messageId: string;
+	  }
 	/** A send() landed while a run was live and was queued into it. */
-	| { type: "queued-message"; sessionId: string; runId: string | null }
+	| {
+			type: "queued-message";
+			at: string;
+			sessionId: string;
+			runId: string | null;
+			/** Id of the queued user-message (also its queueId). */
+			messageId: string;
+	  }
 	/** The auto-resume sweep found interrupted work: resuming it, or giving up after too many attempts. */
 	| {
 			type: "auto-resume";
+			at: string;
 			sessionId: string;
 			runId: string | null;
 			attempt: number;
@@ -245,6 +327,7 @@ export type AgenticEvent =
 	  }
 	| {
 			type: "run-end";
+			at: string;
 			sessionId: string;
 			runId: string;
 			status: "completed" | "cancelled" | "failed";
@@ -258,6 +341,8 @@ export type EventListener = (event: AgenticEvent) => void;
 
 export interface RunResult {
 	status: "completed" | "cancelled" | "failed";
+	/** The run that produced this result — correlates with run/step events and step messages. */
+	runId: string;
 	/** Text of the final assistant message (all text parts joined). */
 	text: string;
 	totals: UsageTotals;
