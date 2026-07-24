@@ -1,3 +1,4 @@
+import type { ModelMessage } from "ai";
 import type { SerializedError, SessionMessage, StoredEvent } from "./types.js";
 
 export type RunProjectionStatus = "running" | "completed" | "cancelled" | "failed";
@@ -198,5 +199,231 @@ export function projectRun(events: StoredEvent[], runId: string): ProjectedRun |
 			status: index === segments.length - 1 ? status : "completed",
 		})),
 		pendingInputs,
+	};
+}
+
+// ── full-session transcript ─────────────────────────────────────────────
+
+/**
+ * Canonical text of a message: string content as-is; array content's text
+ * parts joined. Non-text parts (images, tool calls, …) contribute nothing.
+ */
+export function textOf(message: ModelMessage): string {
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	return (message.content as Array<{ type?: string; text?: string }>)
+		.filter((part) => part.type === "text")
+		.map((part) => part.text ?? "")
+		.join("");
+}
+
+export type ResponseStatus = "streaming" | "completed" | "cancelled" | "failed" | "interrupted";
+
+export interface TranscriptUserItem {
+	kind: "user";
+	/** The durable ledger user-message id. */
+	id: string;
+	/** The run whose response consumed this input; null while queued/unclaimed. */
+	runId: string | null;
+	at: string;
+	/** Canonical text extraction — {@link textOf} over the message. */
+	text: string;
+	/** Full content, for rich rendering. */
+	message: ModelMessage;
+	/** True while pending — no run has consumed the message yet. */
+	queued: boolean;
+	/** App-supplied SendOptions.meta, with the framework's queue markers stripped. */
+	meta?: Record<string, unknown>;
+}
+
+export interface TranscriptResponseItem {
+	kind: "response";
+	/**
+	 * `${runId}/${segmentIndex}` — stable from the first streaming projection
+	 * to the terminal one (segments only append, so indexes never shift). Key
+	 * UI rows on it; treat it as opaque.
+	 */
+	id: string;
+	runId: string;
+	/** Last update: the segment's latest step time; run start while no step yet. */
+	at: string;
+	/** Canonical assistant text of the whole segment. */
+	text: string;
+	/** The segment's stored messages (assistant + tool), for rich rendering. */
+	messages: SessionMessage[];
+	status: ResponseStatus;
+	/** The run's failure, when status is "failed". */
+	error?: SerializedError;
+}
+
+export type TranscriptItem = TranscriptUserItem | TranscriptResponseItem;
+
+export interface SessionTranscript {
+	/** Array order IS the display order. Never re-sort by timestamp. */
+	items: TranscriptItem[];
+	status: "idle" | "streaming" | "interrupted";
+	/** The run still open in the ledger, if any. */
+	activeRunId: string | null;
+}
+
+function segmentText(messages: SessionMessage[]): string {
+	return messages
+		.filter((entry) => entry.message.role === "assistant")
+		.map((entry) => textOf(entry.message))
+		.filter((text) => text.trim().length > 0)
+		.join("\n\n");
+}
+
+// The framework's queue markers surface as the item's `queued`/`runId` state;
+// everything else in meta is the app's own tag, passed through untouched.
+function appMeta(
+	event: Extract<StoredEvent, { type: "user-message" }>,
+): Record<string, unknown> | undefined {
+	if (!event.meta) return undefined;
+	const meta = { ...event.meta };
+	if (queueIdOf(event) !== null) {
+		delete meta.queued;
+		delete meta.queueId;
+	}
+	return Object.keys(meta).length > 0 ? meta : undefined;
+}
+
+/**
+ * Project a session's full event ledger into a renderable transcript: user
+ * turns and response segments in causal display order, with per-item
+ * lifecycle status. This is THE read API for chat UIs — render the items
+ * as-is; never parse raw events, enumerate runs, filter pokes, or re-sort by
+ * timestamp.
+ *
+ * `live` says whether the calling process currently has a run executing for
+ * this session (`Session.transcript()` wires it automatically): an open
+ * run projects as "streaming" when live and "interrupted" when not — the
+ * streaming-now vs crashed-earlier distinction the ledger alone cannot make.
+ * `internal` additionally includes framework-internal user messages (pokes,
+ * identifiable by `meta.poke`) for debug views. Compaction never appears:
+ * summaries are model-view artifacts, not conversation.
+ */
+export function projectSession(
+	events: StoredEvent[],
+	opts: { live?: boolean; internal?: boolean } = {},
+): SessionTranscript {
+	const live = opts.live === true;
+
+	interface UserEntry {
+		event: Extract<StoredEvent, { type: "user-message" }>;
+		index: number;
+		claim: { runId: string; segmentIndex: number } | null;
+		emitted: boolean;
+	}
+	const users: UserEntry[] = [];
+	const usersById = new Map<string, UserEntry>();
+	const runs: { startIndex: number; projected: ProjectedRun }[] = [];
+	const openRuns = new Set<string>();
+
+	for (let index = 0; index < events.length; index += 1) {
+		const event = events[index];
+		if (event?.type === "user-message") {
+			const entry: UserEntry = { event, index, claim: null, emitted: false };
+			users.push(entry);
+			usersById.set(event.id, entry);
+		} else if (event?.type === "run-start") {
+			const projected = projectRun(events, event.runId);
+			if (projected) runs.push({ startIndex: index, projected });
+			openRuns.add(event.runId);
+		} else if (event?.type === "run-end") {
+			openRuns.delete(event.runId);
+		}
+	}
+
+	// An input's consumer is the segment that carries it — for a queued send
+	// the step that acknowledged it; for an initiating input, the run that
+	// settled it. A failed run's pending input re-projects as a successor
+	// segment's input; first claim wins, so it appears exactly once.
+	for (const run of runs) {
+		run.projected.segments.forEach((segment, segmentIndex) => {
+			for (const input of segment.inputs) {
+				const entry = usersById.get(input.id);
+				if (entry && entry.claim === null) {
+					entry.claim = { runId: run.projected.runId, segmentIndex };
+				}
+			}
+		});
+	}
+
+	const items: TranscriptItem[] = [];
+	const emitUsers = (include: (entry: UserEntry) => boolean) => {
+		for (const entry of users) {
+			if (entry.emitted || !include(entry)) continue;
+			entry.emitted = true;
+			if (entry.event.meta?.poke !== undefined && opts.internal !== true) continue;
+			const meta = appMeta(entry.event);
+			items.push({
+				kind: "user",
+				id: entry.event.id,
+				runId: entry.claim?.runId ?? null,
+				at: entry.event.at,
+				text: textOf(entry.event.message),
+				message: entry.event.message,
+				queued: entry.claim === null,
+				...(meta ? { meta } : {}),
+			});
+		}
+	};
+
+	for (const { startIndex, projected } of runs) {
+		// Before a segment's response: its own inputs, plus any message that
+		// arrived before this run started and is not answered by it (still
+		// queued, or claimed by a later run) — all in arrival order.
+		const emitSegmentUsers = (segmentIndex: number) =>
+			emitUsers(
+				(entry) =>
+					(entry.claim !== null &&
+						entry.claim.runId === projected.runId &&
+						entry.claim.segmentIndex === segmentIndex) ||
+					(entry.index < startIndex &&
+						(entry.claim === null || entry.claim.runId !== projected.runId)),
+			);
+		if (projected.segments.length === 0) {
+			// An open run with no step and no initiating input (queued-only
+			// resume): synthesize the in-flight response so a UI has a row to
+			// key on. The first step lands as segment 0, keeping the id.
+			emitSegmentUsers(0);
+			items.push({
+				kind: "response",
+				id: `${projected.runId}/0`,
+				runId: projected.runId,
+				at: projected.startedAt,
+				text: "",
+				messages: [],
+				status: live ? "streaming" : "interrupted",
+			});
+			continue;
+		}
+		projected.segments.forEach((segment, segmentIndex) => {
+			emitSegmentUsers(segmentIndex);
+			const status: ResponseStatus =
+				segment.status === "running" ? (live ? "streaming" : "interrupted") : segment.status;
+			// Every step stamps finishReason, so null + no messages means no
+			// step has landed for this segment yet.
+			const noStepYet = segment.finishReason === null && segment.messages.length === 0;
+			items.push({
+				kind: "response",
+				id: `${projected.runId}/${segmentIndex}`,
+				runId: projected.runId,
+				at: noStepYet ? projected.startedAt : segment.at,
+				text: segmentText(segment.messages),
+				messages: segment.messages,
+				status,
+				...(status === "failed" && projected.error ? { error: projected.error } : {}),
+			});
+		});
+	}
+	emitUsers(() => true);
+
+	const activeRunId = [...openRuns].pop() ?? null;
+	return {
+		items,
+		status: activeRunId === null ? "idle" : live ? "streaming" : "interrupted",
+		activeRunId,
 	};
 }

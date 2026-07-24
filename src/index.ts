@@ -33,7 +33,14 @@ export {
 	type ProjectedRun,
 	type ProjectedRunSegment,
 	projectRun,
+	projectSession,
+	type ResponseStatus,
 	type RunProjectionStatus,
+	type SessionTranscript,
+	type TranscriptItem,
+	type TranscriptResponseItem,
+	type TranscriptUserItem,
+	textOf,
 } from "./projection.js";
 export { type ReplayedSession, replaySession } from "./replay.js";
 export {

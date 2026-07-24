@@ -6,6 +6,7 @@ import { classifyFailure, serializeError } from "./failure.js";
 import { logEvents } from "./logEvents.js";
 import { getContextWindow } from "./modelMeta.js";
 import { createOpenRouter } from "./openrouter.js";
+import { projectSession, type SessionTranscript, textOf } from "./projection.js";
 import { type ReplayedSession, replaySession } from "./replay.js";
 import { createResilientFetch, type ResilientFetchOptions } from "./resilientFetch.js";
 import { createMailbox, type RunLoopOptions, runLoop } from "./run.js";
@@ -127,6 +128,15 @@ export interface Session<TOOLS extends ToolSet = ToolSet> {
 	 * carrying its durable ledger id and persist time.
 	 */
 	messages(): Promise<SessionMessage[]>;
+	/**
+	 * The renderable conversation: user turns and response segments in causal
+	 * display order with per-item lifecycle status (see
+	 * {@link projectSession}). Live-ness is wired from this runtime's
+	 * in-process run registry — the same source isRunning() uses — so an open
+	 * run projects as "streaming" here and as "interrupted" after a crash.
+	 * `internal: true` includes framework-internal messages (pokes).
+	 */
+	transcript(options?: { internal?: boolean }): Promise<SessionTranscript>;
 	/** Lifetime usage/cost totals plus current context pressure. */
 	stats(): Promise<UsageTotals>;
 	/** True when a run was interrupted and resume() would do work. */
@@ -651,6 +661,12 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			async messages() {
 				return replaySession(await storage.load(id)).messages;
 			},
+			async transcript(transcriptOptions = {}) {
+				return projectSession(await storage.load(id), {
+					live: liveRuns.has(id),
+					internal: transcriptOptions.internal,
+				});
+			},
 			async stats() {
 				const replayed = replaySession(await storage.load(id));
 				return {
@@ -1129,13 +1145,7 @@ function lastAssistantText(messages: ModelMessage[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const message = messages[i];
 		if (message.role !== "assistant") continue;
-		const text =
-			typeof message.content === "string"
-				? message.content
-				: (message.content as Array<{ type?: string; text?: string }>)
-						.filter((part) => part.type === "text")
-						.map((part) => part.text ?? "")
-						.join("");
+		const text = textOf(message);
 		if (text.trim()) return text;
 	}
 	return "";
