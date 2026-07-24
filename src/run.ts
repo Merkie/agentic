@@ -12,6 +12,7 @@ import { resolveRetryConfig, retryDelayMs, wait } from "./backoff.js";
 import { resolveCompactionConfig, runCompaction, shouldCompact } from "./compaction.js";
 import { classifyFailure, serializeError } from "./failure.js";
 import { getContextWindow } from "./modelMeta.js";
+import { projectRun, type StreamContext } from "./projection.js";
 import { replaySession } from "./replay.js";
 import { guardToolResultSizes } from "./toolGuard.js";
 import type {
@@ -63,13 +64,21 @@ export interface RunMailbox {
 	/** queueIds of ledger-appended messages the loop has not yet consumed. */
 	queued: string[];
 	/** Live-stream listeners contributed by attached send() calls. */
-	partListeners: Array<(part: unknown) => void>;
+	partListeners: Array<(part: unknown, context: StreamContext) => void>;
 	/** Queue-id-gated listeners; activated only once a model pass includes that input. */
 	queuedPartListeners: Array<{
 		queueId: string;
-		listener: (part: unknown) => void;
+		listener: (part: unknown, context: StreamContext) => void;
 		active: boolean;
 	}>;
+	/**
+	 * Send-acceptance callbacks waiting for this mailbox's run id. Registered
+	 * while `runId` is still null (a send joined a run registered but not yet
+	 * started); execRun flushes them the moment the loop has assigned the id —
+	 * before any stream part can be delivered — and a recovery run inherits
+	 * whatever the dead run never flushed.
+	 */
+	acceptHooks: Array<(runId: string) => void>;
 	/** Signal a new ledger message. Returns false if the run stopped listening. */
 	tryEnqueue(queueId: string): boolean;
 }
@@ -82,6 +91,7 @@ export function createMailbox(): RunMailbox {
 		queued: [],
 		partListeners: [],
 		queuedPartListeners: [],
+		acceptHooks: [],
 		tryEnqueue(queueId: string) {
 			if (!mailbox.accepting) return false;
 			mailbox.attachedQueueIds.add(queueId);
@@ -142,8 +152,14 @@ export interface RunLoopOptions<TOOLS extends ToolSet = ToolSet> {
 	getModel: (modelId: string, agent: AgentConfig<any>) => LanguageModel;
 	emit?: EventListener;
 	abortSignal?: AbortSignal;
-	/** Live stream parts (text deltas, tool calls…) for UIs. */
-	onPart?: (part: TextStreamPart<TOOLS>) => void;
+	/** Live stream parts (text deltas, tool calls…) for UIs, with their agentic identity. */
+	onPart?: (part: TextStreamPart<TOOLS>, context: StreamContext) => void;
+	/**
+	 * The durable user-message id RunResult.messageId reports as this run's
+	 * own. When absent (direct runLoop use), the newest pending input at the
+	 * first pass is used.
+	 */
+	messageId?: string;
 	/**
 	 * Workflow support: when set, a pass that ends cleanly while
 	 * `isSettled()` is false triggers a poke — `pokeMessage(n)` is appended as
@@ -436,6 +452,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 	const mailbox = options.mailbox;
 	if (mailbox) mailbox.runId = runId;
 	let runStarted = options.resumeRunId !== undefined;
+	let resultMessageId = options.messageId ?? "";
 	let totals: UsageTotals = emptyTotals();
 	let finalText = "";
 	let attempt = 0;
@@ -453,7 +470,14 @@ export async function runLoop<TOOLS extends ToolSet>(
 		const serialized = serializeError(error);
 		await append({ type: "run-end", at: now(), runId, status: "failed", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "failed", totals, error: serialized });
-		return { status: "failed", runId, text: finalText, totals, error: serialized };
+		return {
+			status: "failed",
+			runId,
+			messageId: resultMessageId,
+			text: finalText,
+			totals,
+			error: serialized,
+		};
 	};
 
 	const cancel = async (
@@ -513,7 +537,14 @@ export async function runLoop<TOOLS extends ToolSet>(
 		}
 		await append({ type: "run-end", at: now(), runId, status: "cancelled", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "cancelled", totals, error: serialized });
-		return { status: "cancelled", runId, text: finalText, totals, error: serialized };
+		return {
+			status: "cancelled",
+			runId,
+			messageId: resultMessageId,
+			text: finalText,
+			totals,
+			error: serialized,
+		};
 	};
 
 	// Summarize-and-rebase the session. "skip" = nothing left to compact away.
@@ -590,6 +621,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		const replayed = replaySession(events);
 		const inputQueueIds = replayed.pendingQueueIds;
 		const inputMessageIds = replayed.pendingInputMessages.map((entry) => entry.id);
+		if (resultMessageId === "") resultMessageId = inputMessageIds.at(-1) ?? "";
 		if (replayed.pendingMessages > 0) {
 			hoistPendingInputs(replayed.messages, replayed.pendingInputMessages);
 		}
@@ -658,6 +690,28 @@ export async function runLoop<TOOLS extends ToolSet>(
 			await append({ type: "run-start", at: now(), runId, model: agent.model });
 			emit({ type: "run-start", sessionId, runId, model: agent.model });
 		}
+
+		// The transcript identity this pass streams into. projectRun over the
+		// pass snapshot yields the segments prior steps created; this pass's step
+		// begins a new segment only when it folds in input no existing segment
+		// carries while the open segment already has messages — the exact
+		// beginOrExtend condition projection applies when the step is later
+		// replayed, so the id can never drift from projectSession's. Constant
+		// across retries of the same step (the snapshot and pending inputs are
+		// unchanged until a step durably lands).
+		const priorSegments = projectRun(events, runId)?.segments ?? [];
+		const claimedInputIds = new Set(
+			priorSegments.flatMap((segment) => segment.inputs.map((input) => input.id)),
+		);
+		const lastSegment = priorSegments.at(-1);
+		const beginsSegment =
+			lastSegment !== undefined &&
+			lastSegment.messages.length > 0 &&
+			inputMessageIds.some((inputId) => !claimedInputIds.has(inputId));
+		const segmentIndex = beginsSegment
+			? priorSegments.length
+			: Math.max(priorSegments.length - 1, 0);
+		const streamContext: StreamContext = { runId, responseId: `${runId}/${segmentIndex}` };
 
 		// ── one streamText pass ──
 		let compactPending = false;
@@ -777,13 +831,13 @@ export async function runLoop<TOOLS extends ToolSet>(
 					observableProgress = true;
 				}
 				try {
-					options.onPart?.(part);
+					options.onPart?.(part, streamContext);
 				} catch {
 					// a broken part listener must never kill a run
 				}
 				for (const listener of mailbox?.partListeners ?? []) {
 					try {
-						listener(part);
+						listener(part, streamContext);
 					} catch {
 						// same rule for attached listeners
 					}
@@ -791,7 +845,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 				for (const subscription of mailbox?.queuedPartListeners ?? []) {
 					if (!subscription.active) continue;
 					try {
-						subscription.listener(part);
+						subscription.listener(part, streamContext);
 					} catch {
 						// same rule for causally attached listeners
 					}
@@ -913,6 +967,6 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// here is non-fatal: the threshold is still crossed, so the next run
 		// retries it.
 		if (compactPending) await compactNow();
-		return { status: "completed", runId, text: finalText, totals };
+		return { status: "completed", runId, messageId: resultMessageId, text: finalText, totals };
 	}
 }

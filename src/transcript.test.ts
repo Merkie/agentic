@@ -2,8 +2,10 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
+import { tool } from "ai";
 import { convertArrayToReadableStream, MockLanguageModelV3 } from "ai/test";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { createAgentic } from "./agentic.js";
 import { setContextWindow } from "./modelMeta.js";
 import {
@@ -605,6 +607,300 @@ describe("session transcripts over real run ledgers", () => {
 		expect(debug.items[3]?.id).toBe(`${runId}/1`);
 		expect(transcript.items[1]?.id).toBe(`${runId}/0`);
 		expect(transcript.items[2]?.id).toBe(`${runId}/1`);
+	});
+
+	it("fresh send: accepted before any part; multi-step parts all stream into segment 0", async () => {
+		setContextWindow("mock/identity-fresh", 100_000);
+		const storage = memoryStorage();
+		let calls = 0;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls === 1) {
+					return {
+						stream: convertArrayToReadableStream<LanguageModelV3StreamPart>([
+							{ type: "stream-start", warnings: [] },
+							{ type: "tool-call", toolCallId: "t-1", toolName: "touch", input: "{}" },
+							finishPart("tool-calls"),
+						]),
+					};
+				}
+				return { stream: textStream("Done.") };
+			},
+		});
+		const agentic = createAgentic({ storage, getModel: () => model });
+		const session = agentic.session("identity-fresh", {
+			model: "mock/identity-fresh",
+			tools: { touch: tool({ inputSchema: z.object({}), execute: async () => "touched" }) },
+		});
+
+		let accepted: { messageId: string; runId: string; queued: boolean; at: string } | undefined;
+		const contexts: Array<{ responseId: string; runId: string; afterAccept: boolean }> = [];
+		const result = await session.send("Hi", {
+			onAccepted: (info) => {
+				accepted = info;
+			},
+			onPart: (_part, context) => {
+				contexts.push({ ...context, afterAccept: accepted !== undefined });
+			},
+		});
+		expect(result.status).toBe("completed");
+		expect(calls).toBe(2);
+		expect(contexts.length).toBeGreaterThan(0);
+		expect(contexts.every((entry) => entry.afterAccept && entry.runId === result.runId)).toBe(true);
+
+		const events = await storage.load("identity-fresh");
+		const userEvent = events.find(
+			(event): event is Extract<StoredEvent, { type: "user-message" }> =>
+				event.type === "user-message",
+		);
+		expect(userEvent).toBeDefined();
+		expect(accepted).toEqual({
+			messageId: userEvent?.id,
+			runId: result.runId,
+			queued: false,
+			at: userEvent?.at,
+		});
+		expect(result.messageId).toBe(userEvent?.id);
+
+		// Both model steps of the pass streamed into the one transcript response,
+		// and the delivered ids ARE the projected item ids.
+		const transcript = projectSession(events);
+		const itemIds = transcript.items.flatMap((item) => (item.kind === "response" ? [item.id] : []));
+		expect([...new Set(contexts.map((entry) => entry.responseId))]).toEqual(itemIds);
+		expect(itemIds).toEqual([`${result.runId}/0`]);
+		expect(userItem(transcript.items[0]).id).toBe(result.messageId);
+	});
+
+	it("queued send: accepted with the live run, its own message id, and exact segment ids", async () => {
+		setContextWindow("mock/identity-queued", 100_000);
+		const storage = memoryStorage();
+		let calls = 0;
+		let first!: ReturnType<typeof controlledTextStream>;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls === 1) {
+					first = controlledTextStream("Answer A");
+					return { stream: first.stream };
+				}
+				return { stream: textStream("Answer B") };
+			},
+		});
+		let queuedDurably!: () => void;
+		const queued = new Promise<void>((resolve) => {
+			queuedDurably = resolve;
+		});
+		const agentic = createAgentic({
+			storage,
+			getModel: () => model,
+			onEvent: (event) => {
+				if (event.type === "queued-message") queuedDurably();
+			},
+		});
+		const session = agentic.session("identity-queued", { model: "mock/identity-queued" });
+
+		let acceptedA: { messageId: string; runId: string } | undefined;
+		const initiatorIds: string[] = [];
+		let sawDelta!: () => void;
+		const firstDelta = new Promise<void>((resolve) => {
+			sawDelta = resolve;
+		});
+		const firstSend = session.send("A", {
+			onAccepted: (info) => {
+				acceptedA = info;
+			},
+			onPart: (part, context) => {
+				initiatorIds.push(context.responseId);
+				if (part.type === "text-delta") sawDelta();
+			},
+		});
+		await firstDelta;
+		expect(acceptedA).toBeDefined();
+
+		let acceptedB: { messageId: string; runId: string; queued: boolean; at: string } | undefined;
+		const queuedParts: Array<{ responseId: string; afterAccept: boolean }> = [];
+		const secondSend = session.send("B", {
+			onAccepted: (info) => {
+				acceptedB = info;
+			},
+			onPart: (_part, context) => {
+				queuedParts.push({ responseId: context.responseId, afterAccept: acceptedB !== undefined });
+			},
+		});
+		await queued;
+		first.finish();
+		const [a, b] = await Promise.all([firstSend, secondSend]);
+
+		const events = await storage.load("identity-queued");
+		const queuedEvent = events.find(
+			(event): event is Extract<StoredEvent, { type: "user-message" }> =>
+				event.type === "user-message" && event.meta?.queued === true,
+		);
+		expect(acceptedB).toEqual({
+			messageId: queuedEvent?.id,
+			runId: a.runId,
+			queued: true,
+			at: queuedEvent?.at,
+		});
+		// v0.7+ invariant: a queued send's message id IS its queueId.
+		expect(queuedEvent?.meta?.queueId).toBe(acceptedB?.messageId);
+		// The merged result reports the answering run but THIS send's message.
+		expect(b.runId).toBe(a.runId);
+		expect(b.messageId).toBe(acceptedB?.messageId);
+		expect(a.messageId).toBe(acceptedA?.messageId);
+		expect(a.messageId).not.toBe(b.messageId);
+		expect(queuedParts.length).toBeGreaterThan(0);
+		expect(
+			queuedParts.every((entry) => entry.afterAccept && entry.responseId === `${a.runId}/1`),
+		).toBe(true);
+
+		// The initiating listener saw the queued pickup split segments live, with
+		// ids equal to the transcript's response items — order included.
+		const transcript = projectSession(events);
+		const itemIds = transcript.items.flatMap((item) => (item.kind === "response" ? [item.id] : []));
+		expect([...new Set(initiatorIds)]).toEqual(itemIds);
+		expect(itemIds).toEqual([`${a.runId}/0`, `${a.runId}/1`]);
+	});
+
+	it("queue:false send waits for the lock and is accepted with its own dedicated run", async () => {
+		setContextWindow("mock/identity-lock", 100_000);
+		const storage = memoryStorage();
+		let calls = 0;
+		let first!: ReturnType<typeof controlledTextStream>;
+		const model = new MockLanguageModelV3({
+			doStream: async () => {
+				calls += 1;
+				if (calls === 1) {
+					first = controlledTextStream("Answer A");
+					return { stream: first.stream };
+				}
+				return { stream: textStream("Answer B") };
+			},
+		});
+		const agentic = createAgentic({ storage, getModel: () => model });
+		const session = agentic.session("identity-lock", { model: "mock/identity-lock" });
+
+		let sawDelta!: () => void;
+		const firstDelta = new Promise<void>((resolve) => {
+			sawDelta = resolve;
+		});
+		const firstSend = session.send("A", {
+			onPart: (part) => {
+				if (part.type === "text-delta") sawDelta();
+			},
+		});
+		await firstDelta;
+
+		let accepted: { messageId: string; runId: string; queued: boolean; at: string } | undefined;
+		const contexts: Array<{ responseId: string; afterAccept: boolean }> = [];
+		const dedicated = session.send("B", {
+			queue: false,
+			onAccepted: (info) => {
+				accepted = info;
+			},
+			onPart: (_part, context) => {
+				contexts.push({ responseId: context.responseId, afterAccept: accepted !== undefined });
+			},
+		});
+		first.finish();
+		const [a, b] = await Promise.all([firstSend, dedicated]);
+
+		expect(b.runId).not.toBe(a.runId);
+		const events = await storage.load("identity-lock");
+		const bEvent = events.find(
+			(event): event is Extract<StoredEvent, { type: "user-message" }> =>
+				event.type === "user-message" && JSON.stringify(event.message.content).includes("B"),
+		);
+		expect(accepted).toEqual({
+			messageId: bEvent?.id,
+			runId: b.runId,
+			queued: false,
+			at: bEvent?.at,
+		});
+		expect(b.messageId).toBe(bEvent?.id);
+		expect(contexts.length).toBeGreaterThan(0);
+		expect(
+			contexts.every((entry) => entry.afterAccept && entry.responseId === `${b.runId}/0`),
+		).toBe(true);
+		const transcript = projectSession(events);
+		expect(transcript.items.flatMap((item) => (item.kind === "response" ? [item.id] : []))).toEqual(
+			[`${a.runId}/0`, `${b.runId}/0`],
+		);
+	});
+
+	it("cancelled partial: delivered ids match the projected cancelled response exactly", async () => {
+		setContextWindow("mock/identity-cancel", 100_000);
+		const storage = memoryStorage();
+		const abort = new AbortController();
+		const model = new MockLanguageModelV3({
+			doStream: async ({ abortSignal }) => ({
+				stream: hangingTextStream(abortSignal, "kept partial"),
+			}),
+		});
+		const agentic = createAgentic({ storage, getModel: () => model });
+		const session = agentic.session("identity-cancel", { model: "mock/identity-cancel" });
+
+		const responseIds: string[] = [];
+		const result = await session.send("stop me", {
+			abortSignal: abort.signal,
+			onPart: (part, context) => {
+				responseIds.push(context.responseId);
+				if (part.type === "text-delta") abort.abort(new Error("stop"));
+			},
+		});
+		expect(result.status).toBe("cancelled");
+
+		const events = await storage.load("identity-cancel");
+		const userEvent = events.find(
+			(event): event is Extract<StoredEvent, { type: "user-message" }> =>
+				event.type === "user-message",
+		);
+		expect(result.messageId).toBe(userEvent?.id);
+		const transcript = projectSession(events);
+		const itemIds = transcript.items.flatMap((item) => (item.kind === "response" ? [item.id] : []));
+		expect(responseIds.length).toBeGreaterThan(0);
+		expect([...new Set(responseIds)]).toEqual(itemIds);
+		expect(itemIds).toEqual([`${result.runId}/0`]);
+		expect(transcript.items[1]).toMatchObject({ status: "cancelled", text: "kept partial" });
+	});
+
+	it("resumed interrupted run: the recovery pass streams into the next transcript segment", async () => {
+		setContextWindow("mock/identity-resume", 100_000);
+		const storage = memoryStorage();
+		const sessionId = "identity-resume";
+		// SIGKILL shape: an open run with a persisted step, plus a queued message
+		// the dead process never answered.
+		await storage.append(sessionId, user("t0", "u-a", "A"));
+		await storage.append(sessionId, {
+			type: "run-start",
+			at: "t1",
+			runId: "r1",
+			model: "mock/identity-resume",
+		});
+		await storage.append(sessionId, ackStep("t2", "r1", ["u-a"], "a-1", "answer A"));
+		await storage.append(sessionId, user("t3", "q-b", "B", { queued: true, queueId: "q-b" }));
+
+		const model = new MockLanguageModelV3({
+			doStream: async () => ({ stream: textStream("answer B") }),
+		});
+		const agentic = createAgentic({ storage, getModel: () => model });
+		const session = agentic.session(sessionId, { model: "mock/identity-resume" });
+		const responseIds: string[] = [];
+		const result = await session.resume({
+			onPart: (_part, context) => {
+				responseIds.push(context.responseId);
+			},
+		});
+
+		expect(result).toMatchObject({ status: "completed", runId: "r1", messageId: "q-b" });
+		expect(responseIds.length).toBeGreaterThan(0);
+		expect([...new Set(responseIds)]).toEqual(["r1/1"]);
+		const transcript = projectSession(await storage.load(sessionId));
+		expect(transcript.items.flatMap((item) => (item.kind === "response" ? [item.id] : []))).toEqual(
+			["r1/0", "r1/1"],
+		);
+		expect(flat(transcript)).toEqual(["u:A", "r:answer A", "u:B", "r:answer B"]);
 	});
 
 	it("session.transcript() tracks live streaming through to the terminal state", async () => {

@@ -37,6 +37,7 @@ export {
 	type ResponseStatus,
 	type RunProjectionStatus,
 	type SessionTranscript,
+	type StreamContext,
 	type TranscriptItem,
 	type TranscriptResponseItem,
 	type TranscriptUserItem,

@@ -258,6 +258,20 @@ export interface TranscriptResponseItem {
 
 export type TranscriptItem = TranscriptUserItem | TranscriptResponseItem;
 
+/**
+ * Agentic context delivered with every live stream part: the run the part
+ * belongs to and the transcript response item it streams into. `responseId`
+ * equals the {@link TranscriptResponseItem.id} that {@link projectSession}
+ * assigns the segment the current model pass's step lands in, so a UI row
+ * keyed on it at stream time is confirmed — never re-keyed — by the durable
+ * transcript. Retry passes of the same step keep the same `responseId`.
+ */
+export interface StreamContext {
+	runId: string;
+	/** The transcript response item this pass streams into: `${runId}/${segmentIndex}`. */
+	responseId: string;
+}
+
 export interface SessionTranscript {
 	/** Array order IS the display order. Never re-sort by timestamp. */
 	items: TranscriptItem[];

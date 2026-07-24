@@ -6,7 +6,12 @@ import { classifyFailure, serializeError } from "./failure.js";
 import { logEvents } from "./logEvents.js";
 import { getContextWindow } from "./modelMeta.js";
 import { createOpenRouter } from "./openrouter.js";
-import { projectSession, type SessionTranscript, textOf } from "./projection.js";
+import {
+	projectSession,
+	type SessionTranscript,
+	type StreamContext,
+	textOf,
+} from "./projection.js";
 import { type ReplayedSession, replaySession } from "./replay.js";
 import { createResilientFetch, type ResilientFetchOptions } from "./resilientFetch.js";
 import { createMailbox, type RunLoopOptions, runLoop } from "./run.js";
@@ -94,9 +99,29 @@ export interface AgenticOptions {
 export interface SendOptions<TOOLS extends ToolSet = ToolSet> {
 	/**
 	 * Best-effort live stream callback. Parts are not replayed from the ledger;
-	 * the resolved RunResult/session.messages() remain the durable source of truth.
+	 * the resolved RunResult/session.messages() remain the durable source of
+	 * truth. `context.responseId` is the transcript response item the current
+	 * model pass streams into — key optimistic UI rows on it.
 	 */
-	onPart?: (part: TextStreamPart<TOOLS>) => void;
+	onPart?: (part: TextStreamPart<TOOLS>, context: StreamContext) => void;
+	/**
+	 * Send-time identities: fires exactly once per send, after the user-message
+	 * event is durably appended and a run is registered/joined for it, and
+	 * always before this send's first onPart delivery. For a queued send the
+	 * ultimately-answering run can differ (successor collapse) — RunResult.runId
+	 * remains the final authority, and UIs should key rows on transcript ids,
+	 * which never lie. A throwing callback is contained (like onPart) and never
+	 * corrupts the run.
+	 */
+	onAccepted?: (info: {
+		/** The durable user-message ledger id for THIS send. */
+		messageId: string;
+		/** Fresh send: the run created for it. Queued send: the live run it joined. */
+		runId: string;
+		queued: boolean;
+		/** The user-message event's timestamp. */
+		at: string;
+	}) => void;
 	abortSignal?: AbortSignal;
 	/** App-supplied tag stored on the user-message event (dedup keys etc.). */
 	meta?: Record<string, unknown>;
@@ -165,7 +190,7 @@ export interface TaskOptions<T, TOOLS extends ToolSet = ToolSet> {
 	deliverableHint?: string;
 	maxPokes?: number;
 	abortSignal?: AbortSignal;
-	onPart?: (part: TextStreamPart<TOOLS>) => void;
+	onPart?: (part: TextStreamPart<TOOLS>, context: StreamContext) => void;
 }
 
 export interface Agentic {
@@ -267,7 +292,13 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		runOptions: Partial<
 			Pick<
 				RunLoopOptions<TOOLS>,
-				"abortSignal" | "onPart" | "resumeRunId" | "isSettled" | "pokeMessage" | "maxPokes"
+				| "abortSignal"
+				| "onPart"
+				| "resumeRunId"
+				| "isSettled"
+				| "pokeMessage"
+				| "maxPokes"
+				| "messageId"
 			>
 		>,
 		mailbox = createMailbox(),
@@ -301,6 +332,13 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			abortSignal: controller.signal,
 		});
 		liveRuns.set(sessionId, { mailbox, result, controller });
+		// runLoop assigns mailbox.runId synchronously before its first await, so
+		// acceptance hooks registered on this mailbox observe the real run id
+		// (including a resumed run's) before any stream part can be delivered.
+		if (mailbox.runId !== null) {
+			const startedRunId = mailbox.runId;
+			for (const hook of mailbox.acceptHooks.splice(0)) hook(startedRunId);
+		}
 		const cleanup = () => {
 			detachAbortListener?.();
 			if (liveRuns.get(sessionId)?.mailbox === mailbox) liveRuns.delete(sessionId);
@@ -358,6 +396,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		return {
 			status,
 			runId,
+			messageId: latestInputMessageId(events, replayed),
 			text: lastAssistantTextForRun(events, runId),
 			totals,
 			...(error ? { error } : {}),
@@ -369,6 +408,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			queueId: string,
 			live: LiveRun,
 			sendOptions: SendOptions<TOOLS>,
+			acceptQueued: (runId: string) => void,
 		): Promise<RunResult> {
 			let liveResult: RunResult | undefined;
 			let liveFailure: unknown;
@@ -378,7 +418,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				liveFailure = error;
 			}
 
-			return withSessionLock(id, async () => {
+			const result = await withSessionLock(id, async () => {
 				let events = await storage.load(id);
 				let replayed = replaySession(events);
 				// A cancellation step is terminal even if its run-end append failed.
@@ -413,10 +453,10 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					];
 					const recoveryOnPart =
 						listeners.length > 0
-							? (part: TextStreamPart<TOOLS>) => {
+							? (part: TextStreamPart<TOOLS>, context: StreamContext) => {
 									for (const listener of listeners) {
 										try {
-											listener(part);
+											listener(part, context);
 										} catch {
 											// one attached UI listener cannot block the others
 										}
@@ -430,6 +470,9 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					for (const pendingId of pendingQueueIds) {
 						if (pendingId !== queueId) recoveryMailbox.attachedQueueIds.add(pendingId);
 					}
+					// Sends whose acceptance never observed a run id (the joined run
+					// died before starting) are accepted by the recovery run instead.
+					recoveryMailbox.acceptHooks.push(...live.mailbox.acceptHooks.splice(0));
 					return execRun<TOOLS>(
 						id,
 						agent,
@@ -437,6 +480,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 							abortSignal: sendOptions.abortSignal,
 							onPart: recoveryOnPart,
 							resumeRunId,
+							messageId: queueId,
 						},
 						recoveryMailbox,
 					);
@@ -472,6 +516,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						return {
 							status: terminal.status,
 							runId: answeredRunId,
+							messageId: queueId,
 							text: lastAssistantTextForRun(events, answeredRunId),
 							totals: {
 								...replayed.totals,
@@ -487,10 +532,12 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						// messages (not from the original run that missed this queue item).
 						const finalized = await finalizePersistedRun(id, agent, events, replayed);
 						if (finalized) return finalized;
+						acceptQueued(answeredRunId);
 						return execRun<TOOLS>(id, agent, {
 							abortSignal: sendOptions.abortSignal,
 							onPart: sendOptions.onPart,
 							resumeRunId: answeredRunId,
+							messageId: queueId,
 						});
 					}
 				}
@@ -499,6 +546,13 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					`Queued input ${queueId} was recorded as answered without a durable terminal run`,
 				);
 			});
+			// Degenerate races (the joined run never started and an unrelated run
+			// answered from the ledger) settle acceptance with the authoritative
+			// answering run; the guarded callback makes this a no-op otherwise.
+			acceptQueued(result.runId);
+			// A merged result reports the answering run — but always THIS send's
+			// own durable message id.
+			return { ...result, messageId: queueId };
 		}
 
 		return {
@@ -510,12 +564,13 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					const queueId = newId();
 					live.mailbox.attachedQueueIds.add(queueId);
 					return (async () => {
+						const at = new Date().toISOString();
 						// Persist FIRST — the message survives even if everything
 						// after this line dies. Then signal the live run.
 						try {
 							await storage.append(id, {
 								type: "user-message",
-								at: new Date().toISOString(),
+								at,
 								message,
 								id: queueId,
 								meta: { ...sendOptions.meta, queued: true, queueId },
@@ -524,10 +579,24 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 							live.mailbox.attachedQueueIds.delete(queueId);
 							throw error;
 						}
+						let acceptedOnce = false;
+						const acceptQueued = (runId: string) => {
+							if (acceptedOnce) return;
+							acceptedOnce = true;
+							try {
+								sendOptions.onAccepted?.({ messageId: queueId, runId, queued: true, at });
+							} catch {
+								// contained, like onPart: a broken listener must never break a send
+							}
+						};
+						// The joined run's id, when it is already executing; a run that is
+						// registered but not yet started flushes the hook before any part.
+						if (live.mailbox.runId !== null) acceptQueued(live.mailbox.runId);
+						else live.mailbox.acceptHooks.push(acceptQueued);
 						if (sendOptions.onPart) {
 							live.mailbox.queuedPartListeners.push({
 								queueId,
-								listener: sendOptions.onPart as (part: unknown) => void,
+								listener: sendOptions.onPart as (part: unknown, context: StreamContext) => void,
 								active: false,
 							});
 						}
@@ -539,11 +608,11 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 								runId: live.mailbox.runId,
 								messageId: queueId,
 							});
-							return finishQueuedSend(queueId, live, sendOptions);
+							return finishQueuedSend(queueId, live, sendOptions, acceptQueued);
 						}
 						// The run committed to ending while the append settled. Await it,
 						// then causally verify whether it saw this durable message.
-						return finishQueuedSend(queueId, live, sendOptions);
+						return finishQueuedSend(queueId, live, sendOptions, acceptQueued);
 					})();
 				}
 				if (sendOptions.queue !== false && !locks.has(id)) {
@@ -561,10 +630,11 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					void liveResult.catch(() => {});
 					liveRuns.set(id, { mailbox, result: liveResult, controller });
 					const messageId = newId();
+					const acceptedAt = new Date().toISOString();
 					const initialAppend = Promise.resolve(
 						storage.append(id, {
 							type: "user-message",
-							at: new Date().toISOString(),
+							at: acceptedAt,
 							message,
 							id: messageId,
 							meta: sendOptions.meta,
@@ -572,6 +642,19 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					);
 					const result = withSessionLock(id, async () => {
 						await initialAppend;
+						// Registered only after the durable append: an unpersisted send is
+						// never reported accepted. execRun flushes the hook once the run id
+						// exists, before any stream part.
+						if (sendOptions.onAccepted) {
+							const notify = sendOptions.onAccepted;
+							mailbox.acceptHooks.push((runId) => {
+								try {
+									notify({ messageId, runId, queued: false, at: acceptedAt });
+								} catch {
+									// contained, like onPart: a broken listener must never break a send
+								}
+							});
+						}
 						const events = await storage.load(id);
 						const inputIndex = events.findIndex(
 							(event) => event.type === "user-message" && event.id === messageId,
@@ -594,6 +677,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 								onPart: sendOptions.onPart,
 								resumeRunId:
 									prior.interruptedRunId && !finalized ? prior.interruptedRunId : undefined,
+								messageId,
 							},
 							mailbox,
 							controller,
@@ -614,11 +698,13 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					const priorEvents = await storage.load(id);
 					const prior = replaySession(priorEvents);
 					const finalized = await finalizePersistedRun(id, agent, priorEvents, prior);
+					const messageId = newId();
+					const acceptedAt = new Date().toISOString();
 					await storage.append(id, {
 						type: "user-message",
-						at: new Date().toISOString(),
+						at: acceptedAt,
 						message,
-						id: newId(),
+						id: messageId,
 						meta: sendOptions.meta,
 					});
 					if (prior.interruptedRunId && !finalized) {
@@ -628,11 +714,29 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 							runId: prior.interruptedRunId,
 						});
 					}
-					return execRun<TOOLS>(id, agent, {
-						abortSignal: sendOptions.abortSignal,
-						onPart: sendOptions.onPart,
-						resumeRunId: prior.interruptedRunId && !finalized ? prior.interruptedRunId : undefined,
-					});
+					const mailbox = createMailbox();
+					if (sendOptions.onAccepted) {
+						const notify = sendOptions.onAccepted;
+						mailbox.acceptHooks.push((runId) => {
+							try {
+								notify({ messageId, runId, queued: false, at: acceptedAt });
+							} catch {
+								// contained, like onPart: a broken listener must never break a send
+							}
+						});
+					}
+					return execRun<TOOLS>(
+						id,
+						agent,
+						{
+							abortSignal: sendOptions.abortSignal,
+							onPart: sendOptions.onPart,
+							resumeRunId:
+								prior.interruptedRunId && !finalized ? prior.interruptedRunId : undefined,
+							messageId,
+						},
+						mailbox,
+					);
 				});
 			},
 			resume(resumeOptions = {}) {
@@ -655,6 +759,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 						abortSignal: resumeOptions.abortSignal,
 						onPart: resumeOptions.onPart,
 						resumeRunId: replayed.interruptedRunId ?? undefined,
+						messageId: latestInputMessageId(events, replayed),
 					});
 				});
 			},
@@ -843,17 +948,19 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				}
 			}
 
+			let promptMessageId: string | undefined;
 			if (prior.messages.length === 0) {
 				const prompts =
 					typeof taskOptions.prompt === "string"
 						? [toUserMessage(taskOptions.prompt)]
 						: taskOptions.prompt;
 				for (const message of prompts) {
+					promptMessageId = newId();
 					await taskStorage.append(sessionId, {
 						type: "user-message",
 						at: new Date().toISOString(),
 						message,
-						id: newId(),
+						id: promptMessageId,
 					});
 				}
 			}
@@ -870,10 +977,14 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				agent,
 				{
 					abortSignal: taskOptions.abortSignal,
-					onPart: taskOptions.onPart as (part: TextStreamPart<ToolSet>) => void,
+					onPart: taskOptions.onPart as (
+						part: TextStreamPart<ToolSet>,
+						context: StreamContext,
+					) => void,
 					isSettled: () => settled !== null,
 					maxPokes: taskOptions.maxPokes ?? 2,
 					resumeRunId: prior.interruptedRunId ?? undefined,
+					messageId: promptMessageId ?? latestInputMessageId(priorEvents, prior),
 				},
 				undefined,
 				undefined,
@@ -1017,6 +1128,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 				});
 				return execRun<ToolSet>(id, resolvedAgent, {
 					resumeRunId: current.interruptedRunId ?? undefined,
+					messageId: latestInputMessageId(events, current),
 				});
 			});
 			kicks.push(kick);
@@ -1062,6 +1174,30 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 		},
 		storage,
 	};
+}
+
+// RunResult.messageId for non-send entry points (resume, tasks, reconciled
+// runs): the newest unanswered input when there is one, else the interrupted
+// run's recorded initiating input, else the newest user message in the ledger.
+function latestInputMessageId(events: StoredEvent[], replayed: ReplayedSession): string {
+	const pending = replayed.pendingInputMessages.at(-1);
+	if (pending) return pending.id;
+	if (replayed.interruptedRunId) {
+		for (const event of events) {
+			if (
+				event.type === "step" &&
+				event.runId === replayed.interruptedRunId &&
+				event.inputMessageIds.length > 0
+			) {
+				return event.inputMessageIds.at(-1) as string;
+			}
+		}
+	}
+	for (let index = events.length - 1; index >= 0; index -= 1) {
+		const event = events[index];
+		if (event.type === "user-message") return event.id;
+	}
+	return "";
 }
 
 // Which run persisted the first step that causally included this queued

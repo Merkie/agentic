@@ -338,6 +338,12 @@ export interface RunResult {
 	status: "completed" | "cancelled" | "failed";
 	/** The run that produced this result — correlates with run/step events and step messages. */
 	runId: string;
+	/**
+	 * The durable ledger id of the send's own user message. For a queued send
+	 * whose result is another run's merged answer, still THIS send's message
+	 * id — not the initiating input's.
+	 */
+	messageId: string;
 	/** Text of the final assistant message (all text parts joined). */
 	text: string;
 	totals: UsageTotals;

@@ -2216,12 +2216,20 @@ describe("message queueing", () => {
 			model: modelId,
 		});
 
-		const first = session.send("A");
-		const second = session.send("B");
-		await expect(Promise.all([first, second])).resolves.toEqual([
-			expect.objectContaining({ status: "completed", text: "answer to A and B" }),
-			expect.objectContaining({ status: "completed", text: "answer to A and B" }),
-		]);
+		const acceptances: Array<{ send: string; messageId: string; runId: string; queued: boolean }> =
+			[];
+		const partsAfterAccept: Record<"A" | "B", boolean[]> = { A: [], B: [] };
+		const first = session.send("A", {
+			onAccepted: (info) => acceptances.push({ send: "A", ...info }),
+			onPart: () => partsAfterAccept.A.push(acceptances.some((entry) => entry.send === "A")),
+		});
+		const second = session.send("B", {
+			onAccepted: (info) => acceptances.push({ send: "B", ...info }),
+			onPart: () => partsAfterAccept.B.push(acceptances.some((entry) => entry.send === "B")),
+		});
+		const [firstResult, secondResult] = await Promise.all([first, second]);
+		expect(firstResult).toMatchObject({ status: "completed", text: "answer to A and B" });
+		expect(secondResult).toMatchObject({ status: "completed", text: "answer to A and B" });
 
 		expect(calls).toBe(1);
 		const users = prompts[0].filter((message) => message.role === "user");
@@ -2232,6 +2240,31 @@ describe("message queueing", () => {
 		expect(events.slice(0, 2).map((event) => event.type)).toEqual(["user-message", "user-message"]);
 		expect(events.filter((event) => event.type === "run-start")).toHaveLength(1);
 		expect(replaySession(events).pendingMessages).toBe(0);
+
+		// Each same-tick send was accepted exactly once with its own durable
+		// message id and the shared run's real id, before any of its parts.
+		const userEvents = events.filter(
+			(event): event is Extract<StoredEvent, { type: "user-message" }> =>
+				event.type === "user-message",
+		);
+		expect(acceptances).toHaveLength(2);
+		expect(acceptances.find((entry) => entry.send === "A")).toMatchObject({
+			messageId: userEvents[0].id,
+			runId: firstResult.runId,
+			queued: false,
+		});
+		expect(acceptances.find((entry) => entry.send === "B")).toMatchObject({
+			messageId: userEvents[1].id,
+			runId: firstResult.runId,
+			queued: true,
+		});
+		expect(firstResult.messageId).toBe(userEvents[0].id);
+		expect(secondResult.messageId).toBe(userEvents[1].id);
+		expect(secondResult.runId).toBe(firstResult.runId);
+		expect(partsAfterAccept.A.length).toBeGreaterThan(0);
+		expect(partsAfterAccept.B.length).toBeGreaterThan(0);
+		expect(partsAfterAccept.A.every(Boolean)).toBe(true);
+		expect(partsAfterAccept.B.every(Boolean)).toBe(true);
 	});
 
 	it("does not run a same-tick send twice behind an idle resume reservation", async () => {

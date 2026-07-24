@@ -96,7 +96,7 @@ the message in. Key invariants, in `src/run.ts`:
   collapse into one automatically started successor run, and—once that
   successor is running—can be stopped by a subsequent `cancel()`.
 
-### Message identity (v0.7)
+### Message identity (v0.7/v0.8)
 
 Everything in the event stream is covered by ids, minted once at append time
 and paired with timestamps:
@@ -120,7 +120,20 @@ and paired with timestamps:
   causal response segments for database/UI adapters; app code should not parse
   queue markers or infer turns from append order.
 - `RunResult.runId` names the run that produced the result (for a queued send
-  answered by another run, the run that causally answered it).
+  answered by another run, the run that causally answered it);
+  `RunResult.messageId` is always the send's OWN durable user-message id, even
+  when the result is another run's merged answer.
+- Identities surface at send time (v0.8): `SendOptions.onAccepted` fires
+  exactly once per send — after the durable user-message append, before that
+  send's first stream part — with `{ messageId, runId, queued, at }` (queued
+  sends report the live run joined; successor collapse can change the
+  answering run, so `RunResult.runId`/transcript ids stay authoritative). A
+  throwing callback is contained, like `onPart`. Every `onPart` delivery
+  carries a `StreamContext` (`{ runId, responseId }`); `responseId` is the
+  `${runId}/${segmentIndex}` transcript response item the current model pass
+  streams into, derived in the loop from the projected segments plus the
+  pass's pending inputs (the same begin-a-segment condition projection
+  applies), so it always equals the id `projectSession` later assigns.
 - v0.8 requires ledgers written by v0.7 or later. Events carry a schema
   version (`v: 1`), stamped by `encodeEvent`; `decodeEvent` is the single
   validation/normalization point — it stamps well-formed unversioned (v0.7)
