@@ -29,11 +29,14 @@ recovery, resume, message queueing, and auditing all fall out of this.
 - `src/agentic.ts` — public API: `createAgentic()` → `session()` (durable
   chat: `send`/`resume`/`attach`/`messages`/`transcript`/`stats`/
   `isInterrupted`), `task()` (guaranteed-outcome workflows via
-  `submit_deliverable`/`cancel_task` tools), `withRetries()`,
-  `resumeInterrupted()` (the auto-resume sweep). Holds per-session locks and
-  the live-run map. `Agentic.storage` was removed in v0.8: the app constructed
-  the provider and holds its own reference; re-exposing it invited ledger
-  reads/writes outside the projection APIs.
+  `submit_deliverable`/`cancel_task` tools), `transcript(sessionId)` (the
+  config-free read: same projection + live overlay as `Session.transcript`,
+  shared through one internal `transcriptOf` — reading never runs the model,
+  so no AgentConfig is involved), `withRetries()`, `resumeInterrupted()`
+  (the auto-resume sweep). Holds per-session locks and the live-run map.
+  `Agentic.storage` was removed in v0.8: the app constructed the provider
+  and holds its own reference; re-exposing it invited ledger reads/writes
+  outside the projection APIs.
 - `src/run.ts` — `runLoop()`, the heart: replay ledger → streamText → persist
   steps → repeat. Owns retries (via `classifyFailure`), mid-run compaction,
   poking, and the `RunMailbox` for live message queueing. Internal: driving
@@ -45,9 +48,16 @@ recovery, resume, message queueing, and auditing all fall out of this.
   through projection instead.
 - `src/projection.ts` — the read side: `projectRun` (causal response
   segments for one run), `projectSession` (the full renderable transcript
-  behind `session.transcript()`), `textOf`, `StreamContext`.
-- `src/progress.ts` — `progressFromPart`: raw stream part → canonical
-  JSON-serializable activity event for SSE/WebSocket forwarding.
+  behind `agentic.transcript()`/`session.transcript()`), `wireTranscript`
+  (transcript minus each item's raw model `message`/`messages` — the
+  JSON-safe client payload; dumb by design, no options), `textOf`,
+  `StreamContext`. `ProjectedInput` is public as `{ id, at, message, meta?,
+  queued }`; ledger position/queue ids/settlement are projection-internal.
+- `src/progress.ts` — the `ProgressEvent` vocabulary the harness emits
+  (`response-start`/`text`/`reasoning`/`tool-start` (with parsed
+  input)/`tool-end`/`retry`/`run-end`) plus `partProgress`, the internal
+  part→event mapper the run loop applies at its delivery site. Apps never
+  map parts themselves — they receive the events via onProgress/attach.
 - `src/storage.ts` — built-in `StorageProvider` implementations:
   `fileStorage` (JSONL), `memoryStorage`, and the `serializedStorage`
   wrapper. The interface itself and its documented contract (durable atomic
@@ -105,10 +115,11 @@ the message in. Key invariants, in `src/run.ts`:
   it, including a tool-call/result step. If that run later fails, every joined
   caller receives the persisted failure; the input is not automatically
   replayed because doing so could repeat tool side effects.
-- `onPart` listeners are live-only and are not replayed from the ledger. A
-  `queue:false` call already waiting on the session lock can become the run
-  that answers older queued input; those queued callers still receive the
-  durable final result, but may not receive that run's historical deltas.
+- Live listeners (`onPart`, `onProgress`, `attach`) are live-only and are not
+  replayed from the ledger. A `queue:false` call already waiting on the
+  session lock can become the run that answers older queued input; those
+  queued callers still receive the durable final result, but may not receive
+  that run's historical deltas.
 - Every registered run owns a runtime `AbortController`, including the
   pre-start registration window and auto-resume. `agentic.cancel(sessionId,
   reason)` is the deliberate whole-run escape hatch and, unlike an initiating
@@ -155,7 +166,7 @@ and paired with timestamps:
   streams into, derived in the loop from the projected segments plus the
   pass's pending inputs (the same begin-a-segment condition projection
   applies), so it always equals the id `projectSession` later assigns.
-- v0.8 requires ledgers written by v0.7 or later. Events carry a schema
+- v0.9 requires ledgers written by v0.7 or later. Events carry a schema
   version (`v: 1`), stamped by `encodeEvent`; `decodeEvent` is the single
   validation/normalization point — it stamps well-formed unversioned (v0.7)
   events and rejects pre-v0.7 shapes and newer-than-known versions with
@@ -165,31 +176,42 @@ and paired with timestamps:
 for disposable presentation work that needs task validation/retries but should
 not create a recoverable session in the configured storage.
 
-### Live reattachment (v0.8)
+### Live progress (v0.9)
 
-- `session.attach(listener)` live-tails a session: every stream part (with
-  `StreamContext`) from ANY run this process executes for it — the currently
-  live run and runs that start later. Best-effort/live-only like `onPart`,
-  error-contained, detach via the returned function. Every entry point that
-  goes through the internal `execRun` broadcasts (send, queued recovery,
-  resume, auto-resume sweep, and tasks — including `durable: false` ones, which
-  only isolate storage); direct `runLoop()` use does not (no instance
-  registry).
+- The harness emits `ProgressEvent`s itself; apps never map stream parts.
+  Delivery surfaces: `SendOptions.onProgress`/`TaskOptions.onProgress` (the
+  initiating caller) and `session.attach(listener)` (the transport tail:
+  every run this process executes for the session — the currently live run
+  and runs that start later, tasks included, `durable: false` ones too).
+  Raw stream parts remain available ONLY to the initiating caller via
+  `SendOptions.onPart`. All listeners are best-effort/live-only and
+  error-contained; detach via attach's returned function. Every entry point
+  that goes through the internal `execRun` broadcasts (send, queued
+  recovery, resume, auto-resume sweep, and tasks); direct `runLoop()` use
+  does not (no instance registry).
+- One channel, not two: the loop wraps raw parts and progress events into a
+  `RunDelivery` union delivered to the run's options callbacks and the
+  mailbox's queue-id-gated listeners (a queued send's onPart/onProgress ride
+  one union listener; a queued recovery run inherits them on its mailbox).
+  `execRun` composes the attach broadcast over `onProgress` only.
+- Emission points (src/run.ts): `response-start` before `streamText` for
+  every pass (retries included — same `responseId`) and again at each later
+  `start-step` of a tool loop, because each model request's deltas restart
+  at offset 0; text/reasoning/tool-start/tool-end derived from parts at the
+  delivery site (tool-start from `tool-call`, the one part every provider
+  emits exactly once, with parsed input; tool-end from non-preliminary
+  `tool-result`); `retry` at both retry-scheduling sites with the attempt;
+  `run-end` at all three terminal sites (completed exit, fail(), cancel()).
 - The loop mirrors the in-flight pass's accumulated text on `mailbox.partial`
-  (nulled the moment the step persists and on run end); `Session.transcript()`
+  (nulled the moment the step persists and on run end); `transcript()`
   overlays it as `partialText` on the matching "streaming" response item —
-  `projectSession` itself stays pure over the ledger. Text-delta deliveries
-  carry `StreamContext.offset` (chars of the pass's partial text before the
-  delta), so a reconnecting client attaches first, snapshots `transcript()`,
-  and drops deltas with `offset < partialText.length` — snapshot and stream
-  never double-render.
-- `progressFromPart(part, context)` (src/progress.ts) is the canonical
-  activity vocabulary: pure mapping to JSON-serializable `ProgressEvent`s —
-  text (delta + offset), reasoning, tool-start (from `tool-call`, the one part
-  every provider emits exactly once), tool-end (non-preliminary
-  `tool-result`); everything else null. No tool payloads on the wire;
-  terminal/lifecycle state comes from `onAccepted`/`RunResult`/the transcript,
-  not this stream.
+  `projectSession` itself stays pure over the ledger. Text events carry
+  `offset` (chars of the pass's partial text before the delta), so a
+  reconnecting client attaches first, snapshots `transcript()`, drops text
+  events with `offset < partialText.length` — and on every `response-start`
+  resets its expected offset to 0 and (re)keys the bubble by `responseId`.
+  Snapshot and stream never double-render. partialText/offset dedupe
+  semantics are unchanged from v0.8.
 
 ### Auto-resume (the boot sweep)
 

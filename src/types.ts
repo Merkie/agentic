@@ -371,6 +371,12 @@ export interface RunResult {
 	error?: SerializedError;
 }
 
+/**
+ * The guaranteed outcome of {@link Agentic.task}. Note: `totals` observed
+ * inside the submit_deliverable settle callback are not final until the
+ * task's promise resolves — later steps (and run-end accounting) still add
+ * to them.
+ */
 export type TaskOutcome<T = unknown> =
 	| { status: "submitted"; deliverable: T; totals: UsageTotals; sessionId: string }
 	| { status: "cancelled"; reason: string; totals: UsageTotals; sessionId: string }

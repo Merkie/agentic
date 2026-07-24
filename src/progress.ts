@@ -2,25 +2,47 @@ import type { TextStreamPart } from "ai";
 import type { StreamContext } from "./projection.js";
 
 /**
- * The canonical live-activity vocabulary: small, JSON-serializable events an
- * app can forward over SSE/WebSocket verbatim instead of switching over raw
- * AI SDK parts on both sides of the wire. Deliberately lean — no tool
- * inputs/outputs (apps that want payloads read the raw parts in
- * onPart/attach), and no terminal/lifecycle events: completion, failure, and
- * cancellation already arrive through onAccepted/RunResult/the transcript.
+ * The canonical live-activity vocabulary, emitted by the harness itself:
+ * small, JSON-serializable events an app forwards over SSE/WebSocket
+ * verbatim instead of switching over raw AI SDK parts on both sides of the
+ * wire. Delivered to `SendOptions.onProgress` / `TaskOptions.onProgress`
+ * (the initiating caller) and to `session.attach()` listeners (every run
+ * this process executes for the session).
+ *
+ * `tool-start.input` is the parsed tool arguments — JSON-serializable by
+ * construction. Apps that want a leaner wire strip it before forwarding.
+ * `retry` and `run-end` are live-only lifecycle markers; the durable record
+ * of terminal state remains `RunResult`/the transcript.
  */
 export type ProgressEvent =
-	| { type: "text"; responseId: string; runId: string; delta: string; offset: number }
-	| { type: "reasoning"; responseId: string; runId: string; delta: string }
-	| { type: "tool-start"; responseId: string; runId: string; toolCallId: string; toolName: string }
-	| { type: "tool-end"; responseId: string; runId: string; toolCallId: string; toolName: string };
+	/**
+	 * Start of every model pass. Deltas that follow belong to `responseId` and
+	 * their offsets restart at 0. Every model request announces itself: fresh
+	 * passes, retry passes, the later steps of a tool loop, and passes
+	 * continuing the same segment — the event is the pass boundary marker, so
+	 * its `responseId` may repeat.
+	 */
+	| { type: "response-start"; runId: string; responseId: string }
+	| { type: "text"; runId: string; responseId: string; delta: string; offset: number }
+	| { type: "reasoning"; runId: string; responseId: string; delta: string }
+	| {
+			type: "tool-start";
+			runId: string;
+			responseId: string;
+			toolCallId: string;
+			toolName: string;
+			input: unknown;
+	  }
+	| { type: "tool-end"; runId: string; responseId: string; toolCallId: string; toolName: string }
+	/** Live-only: a transient failure is being retried (renderable as "retrying…"). */
+	| { type: "retry"; runId: string; attempt: number }
+	| { type: "run-end"; runId: string; status: "completed" | "cancelled" | "failed" };
 
 /**
- * Map one live stream part to its {@link ProgressEvent}, or null for parts
- * with no activity meaning (start-step, finish, usage bookkeeping, …). Pure
- * and stateless — apply it inside an onPart/attach listener and forward the
- * non-null results; `offset` on text events passes through from
- * {@link StreamContext} for exact reconnect dedupe against `partialText`.
+ * Package-internal: map one live stream part to its activity event, or null
+ * for parts with no activity meaning (start-step, finish, usage bookkeeping,
+ * …). The run loop applies it at the part-delivery site; apps never call it —
+ * they receive the results through onProgress/attach.
  *
  * `tool-start` maps from `tool-call`, not `tool-input-start`: it is the one
  * part every provider emits exactly once per invocation (input-streaming
@@ -28,7 +50,7 @@ export type ProgressEvent =
  * stateless mapper cannot dedupe the two), and it opens the execution window
  * that a non-preliminary `tool-result` closes as `tool-end`.
  */
-export function progressFromPart(
+export function partProgress(
 	// biome-ignore lint/suspicious/noExplicitAny: contravariant position — parts of any ToolSet map
 	part: TextStreamPart<any>,
 	context: StreamContext,
@@ -36,16 +58,17 @@ export function progressFromPart(
 	const { runId, responseId } = context;
 	switch (part.type) {
 		case "text-delta":
-			return { type: "text", responseId, runId, delta: part.text, offset: context.offset ?? 0 };
+			return { type: "text", runId, responseId, delta: part.text, offset: context.offset ?? 0 };
 		case "reasoning-delta":
-			return { type: "reasoning", responseId, runId, delta: part.text };
+			return { type: "reasoning", runId, responseId, delta: part.text };
 		case "tool-call":
 			return {
 				type: "tool-start",
-				responseId,
 				runId,
+				responseId,
 				toolCallId: part.toolCallId,
 				toolName: part.toolName,
+				input: part.input,
 			};
 		case "tool-result":
 			// A preliminary result is a replaceable preview — the tool is still
@@ -53,8 +76,8 @@ export function progressFromPart(
 			if (part.preliminary === true) return null;
 			return {
 				type: "tool-end",
-				responseId,
 				runId,
+				responseId,
 				toolCallId: part.toolCallId,
 				toolName: part.toolName,
 			};

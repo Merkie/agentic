@@ -5,11 +5,10 @@ export type RunProjectionStatus = "running" | "completed" | "cancelled" | "faile
 
 /** A durable user input associated with a projected response segment. */
 export interface ProjectedInput extends SessionMessage {
-	/** Position in the supplied ledger. */
-	eventIndex: number;
+	/** The user-message event's meta, as stored (queue markers included). */
 	meta?: Record<string, unknown>;
+	/** True when the message was queued into a live run rather than initiating one. */
 	queued: boolean;
-	queueId: string | null;
 }
 
 /**
@@ -37,8 +36,23 @@ export interface ProjectedRun {
 	pendingInputs: ProjectedInput[];
 }
 
+// Projection internals carried alongside each input while segments are being
+// built: ledger position, queue identity, settlement. The public
+// ProjectedInput deliberately omits them — they describe the ledger, not the
+// conversation.
 interface IndexedInput extends ProjectedInput {
+	eventIndex: number;
+	queueId: string | null;
 	settled: boolean;
+}
+
+function publicInput({
+	eventIndex: _eventIndex,
+	queueId: _queueId,
+	settled: _settled,
+	...input
+}: IndexedInput): ProjectedInput {
+	return input;
 }
 
 function queueIdOf(event: Extract<StoredEvent, { type: "user-message" }>): string | null {
@@ -120,7 +134,9 @@ export function projectRun(events: StoredEvent[], runId: string): ProjectedRun |
 	}
 	const inputs = allInputs.filter((input) => relevantInputIndexes.has(input.eventIndex));
 
-	type MutableSegment = Omit<ProjectedRunSegment, "status">;
+	type MutableSegment = Omit<ProjectedRunSegment, "status" | "inputs"> & {
+		inputs: IndexedInput[];
+	};
 	const segments: MutableSegment[] = [];
 	let current: MutableSegment | null = null;
 	let lastStepIndex = startIndex;
@@ -196,9 +212,10 @@ export function projectRun(events: StoredEvent[], runId: string): ProjectedRun |
 		...(terminal?.error ? { error: terminal.error } : {}),
 		segments: segments.map((segment, index) => ({
 			...segment,
+			inputs: segment.inputs.map(publicInput),
 			status: index === segments.length - 1 ? status : "completed",
 		})),
-		pendingInputs,
+		pendingInputs: pendingInputs.map(publicInput),
 	};
 }
 
@@ -448,5 +465,40 @@ export function projectSession(
 		items,
 		status: activeRunId === null ? "idle" : live ? "streaming" : "interrupted",
 		activeRunId,
+	};
+}
+
+// ── the wire shape ──────────────────────────────────────────────────────
+
+/** {@link TranscriptUserItem} minus the raw model `message`. */
+export type WireTranscriptUserItem = Omit<TranscriptUserItem, "message">;
+/** {@link TranscriptResponseItem} minus the raw stored `messages`. */
+export type WireTranscriptResponseItem = Omit<TranscriptResponseItem, "messages">;
+export type WireTranscriptItem = WireTranscriptUserItem | WireTranscriptResponseItem;
+
+/** {@link SessionTranscript} with wire-shaped items — see {@link wireTranscript}. */
+export interface WireTranscript extends Omit<SessionTranscript, "items"> {
+	items: WireTranscriptItem[];
+}
+
+/**
+ * The transcript as a client payload: every item minus its raw model
+ * `message`/`messages` fields — clients render the pre-extracted `text`,
+ * statuses, and ids, and dropping the model payloads is also what keeps the
+ * body JSON-safe (binary image/audio parts live inside the raw messages).
+ * Everything else passes through untouched. Pure — the input transcript is
+ * not modified.
+ */
+export function wireTranscript(transcript: SessionTranscript): WireTranscript {
+	return {
+		...transcript,
+		items: transcript.items.map((item) => {
+			if (item.kind === "user") {
+				const { message: _message, ...wire } = item;
+				return wire;
+			}
+			const { messages: _messages, ...wire } = item;
+			return wire;
+		}),
 	};
 }

@@ -12,6 +12,7 @@ import { resolveRetryConfig, retryDelayMs, wait } from "./backoff.js";
 import { resolveCompactionConfig, runCompaction, shouldCompact } from "./compaction.js";
 import { classifyFailure, serializeError } from "./failure.js";
 import { getContextWindow } from "./modelMeta.js";
+import { type ProgressEvent, partProgress } from "./progress.js";
 import { projectRun, type StreamContext } from "./projection.js";
 import { replaySession } from "./replay.js";
 import { guardToolResultSizes } from "./toolGuard.js";
@@ -50,6 +51,16 @@ import { addStepToTotals, contextTokensOf, emptyTotals, extractStepUsage } from 
 // trailing unanswered user messages (`pendingMessages`) so resume() knows
 // there is queued work even when the mailbox died with its process.
 
+/**
+ * One item on the live delivery channel: a raw stream part (the onPart tap)
+ * or a canonical {@link ProgressEvent}. A single union keeps the wiring for
+ * send/task/resume/sweep/queued-recovery uniform — every listener slot
+ * carries both kinds instead of maintaining parallel listener arrays.
+ */
+export type RunDelivery =
+	| { kind: "part"; part: unknown; context: StreamContext }
+	| { kind: "progress"; event: ProgressEvent };
+
 export interface RunMailbox {
 	/** The live run's id, set when the loop starts. */
 	runId: string | null;
@@ -63,12 +74,13 @@ export interface RunMailbox {
 	attachedQueueIds: Set<string>;
 	/** queueIds of ledger-appended messages the loop has not yet consumed. */
 	queued: string[];
-	/** Live-stream listeners contributed by attached send() calls. */
-	partListeners: Array<(part: unknown, context: StreamContext) => void>;
-	/** Queue-id-gated listeners; activated only once a model pass includes that input. */
-	queuedPartListeners: Array<{
+	/**
+	 * Queue-id-gated live listeners contributed by attached send() calls;
+	 * activated only once a model pass includes that input.
+	 */
+	queuedListeners: Array<{
 		queueId: string;
-		listener: (part: unknown, context: StreamContext) => void;
+		listener: (delivery: RunDelivery) => void;
 		active: boolean;
 	}>;
 	/**
@@ -96,8 +108,7 @@ export function createMailbox(): RunMailbox {
 		accepting: true,
 		attachedQueueIds: new Set(),
 		queued: [],
-		partListeners: [],
-		queuedPartListeners: [],
+		queuedListeners: [],
 		acceptHooks: [],
 		partial: null,
 		tryEnqueue(queueId: string) {
@@ -153,6 +164,12 @@ export interface RunLoopOptions<TOOLS extends ToolSet = ToolSet> {
 	abortSignal?: AbortSignal;
 	/** Live stream parts (text deltas, tool calls…) for UIs, with their agentic identity. */
 	onPart?: (part: TextStreamPart<TOOLS>, context: StreamContext) => void;
+	/**
+	 * Canonical live progress (response-start, text/reasoning/tool activity,
+	 * retry, run-end). Same containment rule as onPart: a throwing listener
+	 * never breaks a run.
+	 */
+	onProgress?: (event: ProgressEvent) => void;
 	/**
 	 * The durable user-message id RunResult.messageId reports as this run's
 	 * own. When absent (direct runLoop use), the newest pending input at the
@@ -447,6 +464,33 @@ export async function runLoop<TOOLS extends ToolSet>(
 	};
 	const append = (event: StoredEvent) => storage.append(sessionId, event);
 
+	// The single live delivery channel: the initiating caller's callbacks plus
+	// the mailbox's queue-id-gated listeners, every one error-contained.
+	const deliver = (delivery: RunDelivery) => {
+		if (delivery.kind === "part") {
+			try {
+				options.onPart?.(delivery.part as TextStreamPart<TOOLS>, delivery.context);
+			} catch {
+				// a broken part listener must never kill a run
+			}
+		} else {
+			try {
+				options.onProgress?.(delivery.event);
+			} catch {
+				// same rule for progress listeners
+			}
+		}
+		for (const subscription of options.mailbox?.queuedListeners ?? []) {
+			if (!subscription.active) continue;
+			try {
+				subscription.listener(delivery);
+			} catch {
+				// same rule for causally attached listeners
+			}
+		}
+	};
+	const progress = (event: ProgressEvent) => deliver({ kind: "progress", event });
+
 	const runId = options.resumeRunId ?? newId();
 	const mailbox = options.mailbox;
 	if (mailbox) mailbox.runId = runId;
@@ -472,6 +516,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		const serialized = serializeError(error);
 		await append({ type: "run-end", at: now(), runId, status: "failed", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "failed", totals, error: serialized });
+		progress({ type: "run-end", runId, status: "failed" });
 		return {
 			status: "failed",
 			runId,
@@ -542,6 +587,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		}
 		await append({ type: "run-end", at: now(), runId, status: "cancelled", error: serialized });
 		emit({ type: "run-end", sessionId, runId, status: "cancelled", totals, error: serialized });
+		progress({ type: "run-end", runId, status: "cancelled" });
 		return {
 			status: "cancelled",
 			runId,
@@ -632,7 +678,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		}
 		if (mailbox && inputQueueIds.length > 0) {
 			const included = new Set(inputQueueIds);
-			for (const subscription of mailbox.queuedPartListeners) {
+			for (const subscription of mailbox.queuedListeners) {
 				if (included.has(subscription.queueId)) subscription.active = true;
 			}
 		}
@@ -673,6 +719,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 						delayMs,
 						error: cls.error,
 					});
+					progress({ type: "retry", runId, attempt });
 					await wait(delayMs, options.abortSignal).catch(() => {});
 					continue;
 				}
@@ -717,6 +764,12 @@ export async function runLoop<TOOLS extends ToolSet>(
 			? priorSegments.length
 			: Math.max(priorSegments.length - 1, 0);
 		const streamContext: StreamContext = { runId, responseId: `${runId}/${segmentIndex}` };
+		// The pass boundary marker: every model pass announces itself before its
+		// first delta, so clients reset their expected text offset to 0 and
+		// (re)key the bubble by responseId. Retry passes and passes continuing
+		// the same segment repeat the same responseId — that repetition IS the
+		// signal that offsets restart.
+		progress({ type: "response-start", runId, responseId: streamContext.responseId });
 
 		// ── one streamText pass ──
 		let compactPending = false;
@@ -726,6 +779,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		let streamError: unknown;
 		let queueIdsForNextStep = inputQueueIds;
 		let messageIdsForNextStep = inputMessageIds;
+		let stepsStarted = 0;
 		const partialStep = emptyPartialStepCapture();
 		// onStepFinish persistence is async; every pending append must settle
 		// before the next pass replays the session, or the replay races the
@@ -829,6 +883,16 @@ export async function runLoop<TOOLS extends ToolSet>(
 		// AI_NoOutputGeneratedError). Keep the richer chunk when both happen.
 		try {
 			for await (const part of result.fullStream) {
+				// One streamText pass can hold several model steps (the tool loop).
+				// Every step is a fresh model response whose text offsets restart at
+				// 0, so each step after the first re-announces the boundary marker;
+				// the pass's first step was announced before streamText above.
+				if (part.type === "start-step") {
+					stepsStarted += 1;
+					if (stepsStarted > 1) {
+						progress({ type: "response-start", runId, responseId: streamContext.responseId });
+					}
+				}
 				// A text delta's offset is the partial text BEFORE the delta is folded
 				// in — the same accumulation transcript() overlays as partialText, so
 				// `offset < partialText.length` is an exact reconnect dedupe test.
@@ -848,26 +912,9 @@ export async function runLoop<TOOLS extends ToolSet>(
 				) {
 					observableProgress = true;
 				}
-				try {
-					options.onPart?.(part, partContext);
-				} catch {
-					// a broken part listener must never kill a run
-				}
-				for (const listener of mailbox?.partListeners ?? []) {
-					try {
-						listener(part, partContext);
-					} catch {
-						// same rule for attached listeners
-					}
-				}
-				for (const subscription of mailbox?.queuedPartListeners ?? []) {
-					if (!subscription.active) continue;
-					try {
-						subscription.listener(part, partContext);
-					} catch {
-						// same rule for causally attached listeners
-					}
-				}
+				deliver({ kind: "part", part, context: partContext });
+				const activity = partProgress(part, partContext);
+				if (activity) deliver({ kind: "progress", event: activity });
 			}
 		} catch (err) {
 			if (streamError === undefined) streamError = err;
@@ -924,6 +971,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 				delayMs,
 				error: cls.error,
 			});
+			progress({ type: "retry", runId, attempt });
 			try {
 				await wait(delayMs, options.abortSignal);
 			} catch (abortReason) {
@@ -982,6 +1030,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		}
 		await append({ type: "run-end", at: now(), runId, status: "completed" });
 		emit({ type: "run-end", sessionId, runId, status: "completed", totals });
+		progress({ type: "run-end", runId, status: "completed" });
 		// The model finished its turn over the threshold — compact silently
 		// AFTER the run so the next turn starts fresh, instead of re-entering
 		// the model just to regenerate an answer it already gave. A failure

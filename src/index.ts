@@ -39,8 +39,13 @@ export {
 	type TranscriptItem,
 	type TranscriptResponseItem,
 	type TranscriptUserItem,
+	type WireTranscript,
+	type WireTranscriptItem,
+	type WireTranscriptResponseItem,
+	type WireTranscriptUserItem,
+	wireTranscript,
 } from "./projection.js";
-export { type ProgressEvent, progressFromPart } from "./progress.js";
+export type { ProgressEvent } from "./progress.js";
 
 // ── storage: bring-your-own persistence + the event codec ────────────────
 export { decodeEvent, encodeEvent } from "./serialize.js";

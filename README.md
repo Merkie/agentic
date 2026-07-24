@@ -79,7 +79,7 @@ const chat = agentic.session("chat:user-123", {
   compaction: { limit: 0.3 },          // compact at 30% of context window
 });
 const reply = await chat.send("hey!", {
-  onPart: (part, { responseId }) => {/* stream to UI, keyed on responseId */},
+  onProgress: (e) => {/* forward to the UI verbatim, keyed on e.responseId */},
 });
 
 // ── workflow task with a guaranteed outcome ───────────────────────────
@@ -123,11 +123,15 @@ a large interrupted backlog from creating an unbounded provider stampede.
 
 ## Reading a chat
 
-`session.transcript()` is THE read API for rendering a conversation:
+`agentic.transcript(sessionId)` is THE read API for rendering a conversation
+— config-free, because reading never runs the model (no tools or prompts to
+build in a GET route). `wireTranscript` drops the raw model
+`message`/`messages` payloads from each item, leaving the JSON-safe shape a
+client renders:
 
 ```ts
 app.get("/chats/:id/messages", async (req, res) => {
-  res.json(await agentic.session(req.params.id, agent).transcript());
+  res.json(wireTranscript(await agentic.transcript(req.params.id)));
 });
 ```
 
@@ -138,26 +142,26 @@ text is pre-extracted onto each item (`item.text`); every id is durable,
 minted once at append time and stable across restarts, compaction, and from
 the first streamed token to the terminal state; and every response item
 carries its lifecycle: `streaming | completed | cancelled | failed |
-interrupted`. `projectSession(events)` is the pure form for a ledger you
-already hold; `projectRun(events, runId)` scopes to one run.
+interrupted`. `session.transcript()` returns the identical projection when
+you already hold a session; `projectSession(events)` is the pure form for a
+ledger you already hold; `projectRun(events, runId)` scopes to one run.
 `session.messages()` is the model's replay view — feed it to models, don't
-render it. v0.8 reads ledgers written by v0.7 or later; older data fails to
+render it. v0.9 reads ledgers written by v0.7 or later; older data fails to
 load with a descriptive error.
 
 ## Streaming with stable identities
 
 Every id a UI needs exists before the first token arrives. `onAccepted` fires
 once per send — after the user message is durably appended, before its first
-stream part — and every `onPart` delivery carries a `StreamContext` whose
-`responseId` equals the transcript response item the pass streams into. Key
-the optimistic bubble on it; the durable transcript confirms it, never
-re-keys it:
+progress event — and every progress event carries the `responseId` of the
+transcript response item the pass streams into. Key the optimistic bubble on
+it; the durable transcript confirms it, never re-keys it:
 
 ```ts
 const result = await chat.send(text, {
   onAccepted: ({ messageId }) => ui.userBubble(messageId, text),
-  onPart: (part, { responseId }) => {
-    if (part.type === "text-delta") ui.append(responseId, part.text);
+  onProgress: (e) => {
+    if (e.type === "text") ui.append(e.responseId, e.delta);
   },
 });
 // result.messageId — this send's durable user-message id (onAccepted's)
@@ -165,40 +169,45 @@ const result = await chat.send(text, {
 ```
 
 No client-side id minting and no placeholder rows: while a run is in flight
-the transcript already contains its `streaming` response item. Stream parts
-are live-only and never replayed; the transcript is the durable source of
-truth.
-
-## Reconnecting
-
-`session.attach(listener)` live-tails every run this process executes for a
-session — the currently live one and any that start later. A reconnecting
-client attaches first, snapshots, then dedupes by character offset:
-
-```ts
-const detach = session.attach((part, ctx) => forward(part, ctx));
-const snapshot = await session.transcript(); // streaming item carries partialText
-// drop text deltas whose ctx.offset < that item's partialText.length
-```
-
-The snapshot and the stream can never double-render a character.
+the transcript already contains its `streaming` response item. Progress
+events are live-only and never replayed; the transcript is the durable
+source of truth. (Raw AI SDK stream parts remain available to the initiating
+caller through `onPart`, for the rare app that needs them.)
 
 ## Progress over the wire
 
-`progressFromPart(part, context)` maps raw stream parts to a small
-JSON-serializable activity vocabulary (`text` / `reasoning` / `tool-start` /
-`tool-end`, keyed by `responseId`) so both sides of the wire stop switching
-over AI SDK part types:
+The harness emits a small JSON-serializable activity vocabulary directly —
+`ProgressEvent`: `response-start` · `text` (delta + offset) · `reasoning` ·
+`tool-start` (with the parsed tool input) · `tool-end` · `retry` ·
+`run-end`. Forward it verbatim; neither side of the wire switches over AI
+SDK part types:
 
 ```ts
-session.attach((part, ctx) => {
-  const event = progressFromPart(part, ctx);
-  if (event) res.write(`data: ${JSON.stringify(event)}\n\n`);
+await chat.send(text, {
+  onProgress: (e) => res.write(`data: ${JSON.stringify(e)}\n\n`),
 });
 ```
 
-Terminal state doesn't travel on this stream — completion, failure, and
-cancellation arrive through `onAccepted`/`RunResult`/the transcript.
+`retry` and `run-end` are live lifecycle markers (render "retrying…", close
+the stream); the durable record of terminal state is still
+`RunResult`/the transcript.
+
+## Reconnecting
+
+`session.attach(listener)` delivers the same `ProgressEvent` stream for
+every run this process executes for a session — the currently live one and
+any that start later. A reconnecting client attaches first, snapshots, then
+dedupes by character offset:
+
+```ts
+const detach = session.attach((e) => res.write(`data: ${JSON.stringify(e)}\n\n`));
+const snapshot = await session.transcript(); // streaming item carries partialText
+// drop text events whose e.offset < that item's partialText.length;
+// on every response-start, reset the expected offset to 0 and (re)key
+// the bubble by e.responseId — it marks a new model pass
+```
+
+The snapshot and the stream can never double-render a character.
 
 ## Custom storage: the provider contract
 
@@ -231,9 +240,10 @@ Four things an app never does, and where each need is served instead:
 | Never | Instead |
 |---|---|
 | Insert placeholder/optimistic rows for in-flight turns | `transcript()` projects the streaming state |
-| Read or write ledger events outside your provider | `transcript()` / `projectSession` |
-| Mint message/turn ids | `onAccepted` · `RunResult.messageId` · `StreamContext.responseId` |
-| Parse raw events or stream parts into app vocabulary | `progressFromPart` · transcript statuses |
+| Read or write ledger events outside your provider | `agentic.transcript()` / `projectSession` |
+| Mint message/turn ids | `onAccepted` · `RunResult.messageId` · `ProgressEvent.responseId` |
+| Parse raw events or stream parts into app vocabulary | `onProgress`/`attach` ProgressEvents · transcript statuses |
+| Hand-strip model payloads for the client | `wireTranscript()` |
 
 ## Cancellation
 
