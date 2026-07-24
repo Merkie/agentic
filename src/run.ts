@@ -481,7 +481,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 					at: now(),
 					runId,
 					messages: stored,
-					...(currentInputMessageIds.length > 0 ? { inputMessageIds: currentInputMessageIds } : {}),
+					inputMessageIds: currentInputMessageIds,
 					inputQueueIds: currentInputQueueIds,
 					acknowledgesInput: true,
 					finishReason: "cancelled",
@@ -501,7 +501,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 				finishReason: "cancelled",
 				usage,
 				messages: stored,
-				...(currentInputMessageIds.length > 0 ? { inputMessageIds: currentInputMessageIds } : {}),
+				inputMessageIds: currentInputMessageIds,
 				toolCalls: (partial?.toolCalls ?? []).map((call) => ({
 					toolName: call.toolName,
 					input: call.input,
@@ -558,18 +558,10 @@ export async function runLoop<TOOLS extends ToolSet>(
 					message,
 				};
 			});
-			// A pending input replayed from a pre-v0.7 ledger has no id for replay
-			// to re-link by; record the legacy index pair for those only.
-			const pendingInputs = replayed.pendingInputMessages.flatMap((entry, pendingIndex) => {
-				if (entry.id !== null) return [];
-				const messageIndex = compacted.messages.indexOf(entry.message);
-				return messageIndex >= 0 ? [{ pendingIndex, messageIndex }] : [];
-			});
 			await append({
 				type: "compaction",
 				at: compactedAt,
 				messages: stored,
-				...(pendingInputs.length > 0 ? { pendingInputs } : {}),
 				usage: compacted.usage,
 			});
 			// cost counts; the summarizer's context size is not the live chat's
@@ -597,9 +589,7 @@ export async function runLoop<TOOLS extends ToolSet>(
 		const events = await storage.load(sessionId);
 		const replayed = replaySession(events);
 		const inputQueueIds = replayed.pendingQueueIds;
-		const inputMessageIds = replayed.pendingInputMessages.flatMap((entry) =>
-			entry.id === null ? [] : [entry.id],
-		);
+		const inputMessageIds = replayed.pendingInputMessages.map((entry) => entry.id);
 		if (replayed.pendingMessages > 0) {
 			hoistPendingInputs(replayed.messages, replayed.pendingInputMessages);
 		}

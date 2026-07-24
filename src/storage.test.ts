@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -12,12 +13,17 @@ afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map((dir) => fsp.rm(dir, { recursive: true, force: true })));
 });
 
+// Mirrors fileStorage's session-file codec, for tests that handcraft files.
+const fileFor = (sessionId: string) =>
+	`~${Buffer.from(sessionId, "utf8").toString("base64url")}.jsonl`;
+
 type UserMessageEvent = Extract<StoredEvent, { type: "user-message" }>;
 
 function multimodalEvent(image: Uint8Array, audio: ArrayBuffer): UserMessageEvent {
 	return {
 		type: "user-message",
 		at: "t",
+		id: "u-multimodal",
 		message: {
 			role: "user",
 			content: [
@@ -73,14 +79,81 @@ describe("event serialization", () => {
 		const event: StoredEvent = {
 			type: "user-message",
 			at: "t",
+			id: "u-markers",
 			message: { role: "user", content: "marker collision" },
 			meta: markerObjects,
 		};
 
 		const decoded = decodeEvent(encodeEvent(event));
-		expect(decoded).toEqual(event);
+		expect(decoded).toEqual({ ...event, v: 1 });
 		if (decoded.type !== "user-message") throw new Error("expected user-message");
 		expect(decoded.meta?.exactBinaryEnvelope).not.toBeInstanceOf(Uint8Array);
+	});
+
+	it("stamps v: 1 on well-formed unversioned events (v0.7 ledgers)", () => {
+		const user = decodeEvent(
+			JSON.stringify({
+				type: "user-message",
+				at: "t",
+				id: "u1",
+				message: { role: "user", content: "hi" },
+			}),
+		);
+		expect(user.v).toBe(1);
+
+		// v0.7's cancellation step could omit an empty input membership.
+		const step = decodeEvent(
+			JSON.stringify({
+				type: "step",
+				at: "t",
+				runId: "r",
+				messages: [{ id: "a1", message: { role: "assistant", content: "ok" } }],
+				inputQueueIds: [],
+				acknowledgesInput: true,
+				finishReason: "cancelled",
+				usage: {},
+			}),
+		);
+		expect(step.v).toBe(1);
+		if (step.type !== "step") throw new Error("expected step");
+		expect(step.inputMessageIds).toEqual([]);
+	});
+
+	it("rejects pre-v0.7 events (missing message identity) with a descriptive error", () => {
+		const cases = [
+			// user-message without an id (pre-v0.7 wrote inputId or nothing)
+			{ type: "user-message", at: "t", message: { role: "user", content: "hi" } },
+			// step with plain ModelMessage elements instead of StoredMessage envelopes
+			{
+				type: "step",
+				at: "t",
+				runId: "r",
+				messages: [{ role: "assistant", content: "old" }],
+				finishReason: "stop",
+				usage: {},
+			},
+			// compaction with legacy index-pair pending-input linkage
+			{
+				type: "compaction",
+				at: "t",
+				messages: [{ id: "s1", message: { role: "user", content: "<summary>" } }],
+				pendingInputs: [{ pendingIndex: 0, messageIndex: 1 }],
+			},
+		];
+		for (const event of cases) {
+			expect(() => decodeEvent(JSON.stringify(event))).toThrow(/before agentic v0\.7/);
+		}
+	});
+
+	it("rejects an unknown future schema version", () => {
+		const future = JSON.stringify({
+			type: "user-message",
+			at: "t",
+			v: 2,
+			id: "u1",
+			message: { role: "user", content: "hi" },
+		});
+		expect(() => decodeEvent(future)).toThrow(/newer agentic/);
 	});
 });
 
@@ -129,12 +202,12 @@ describe("fileStorage", () => {
 			model: "m",
 		};
 		await fsp.writeFile(
-			path.join(dir, "torn.jsonl"),
+			path.join(dir, fileFor("torn")),
 			`${encodeEvent(complete)}\n{"type":"step","at":"t2"`,
 			"utf8",
 		);
 
-		expect(await storage.load("torn")).toEqual([complete]);
+		expect(await storage.load("torn")).toEqual([{ ...complete, v: 1 }]);
 	});
 
 	it("rejects an invalid middle record", async () => {
@@ -154,7 +227,7 @@ describe("fileStorage", () => {
 			status: "completed",
 		};
 		await fsp.writeFile(
-			path.join(dir, "middle-corrupt.jsonl"),
+			path.join(dir, fileFor("middle-corrupt")),
 			`${encodeEvent(first)}\nnot-json\n${encodeEvent(last)}\n`,
 			"utf8",
 		);
@@ -166,7 +239,7 @@ describe("fileStorage", () => {
 		const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "agentic-storage-"));
 		tempDirs.push(dir);
 		const storage = fileStorage(dir);
-		await fsp.writeFile(path.join(dir, "final-corrupt.jsonl"), "not-json\n", "utf8");
+		await fsp.writeFile(path.join(dir, fileFor("final-corrupt")), "not-json\n", "utf8");
 
 		await expect(storage.load("final-corrupt")).rejects.toThrow();
 	});
@@ -197,7 +270,7 @@ describe("fileStorage", () => {
 		]);
 	});
 
-	it("uses distinct reversible filenames for Unicode ids that collided in the legacy codec", async () => {
+	it("uses distinct reversible filenames for Unicode session ids", async () => {
 		const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "agentic-storage-"));
 		tempDirs.push(dir);
 		const storage = fileStorage(dir);
@@ -222,31 +295,17 @@ describe("fileStorage", () => {
 		expect(names.every((name) => name.startsWith("~"))).toBe(true);
 	});
 
-	it("loads and continues existing legacy ASCII session files", async () => {
+	it("does not resolve pre-v0.7 legacy filenames — the session is simply not found", async () => {
 		const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "agentic-storage-"));
 		tempDirs.push(dir);
-		const first: StoredEvent = {
-			type: "run-start",
-			at: "t1",
-			runId: "r1",
-			model: "m",
-		};
+		// A file in the legacy v0.5.0 %-escape name format.
 		await fsp.writeFile(
 			path.join(dir, "chat%3auser%2f123.jsonl"),
-			`${encodeEvent(first)}\n`,
+			`${encodeEvent({ type: "run-start", at: "t1", runId: "r1", model: "m" })}\n`,
 			"utf8",
 		);
 		const storage = fileStorage(dir);
-		expect(await storage.load("chat:user/123")).toEqual([first]);
-
-		await storage.append("chat:user/123", {
-			type: "run-end",
-			at: "t2",
-			runId: "r1",
-			status: "completed",
-		});
-		expect(await storage.load("chat:user/123")).toHaveLength(2);
-		expect(await storage.listSessions?.()).toContain("chat:user/123");
-		expect(await fsp.readdir(dir)).toEqual(["chat%3auser%2f123.jsonl"]);
+		expect(await storage.load("chat:user/123")).toEqual([]);
+		expect(await storage.listSessions?.()).toEqual([]);
 	});
 });

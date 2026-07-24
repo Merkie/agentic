@@ -56,32 +56,15 @@ export function serializedStorage(provider: StorageProvider): StorageProvider {
 	};
 }
 
-// Legacy v0.5.0 name codec. Retained only so existing ledgers remain readable;
-// its variable-width UTF-16 escapes are not injective for arbitrary Unicode.
-function legacyFileNameFor(sessionId: string): string {
-	return `${sessionId.replace(/[^a-zA-Z0-9._-]/g, (c) => `%${c.charCodeAt(0).toString(16)}`)}.jsonl`;
-}
-
-// `~` could never appear raw in a legacy name (legacy escaped it as `%7e`),
-// making this prefix unambiguous. base64url over UTF-8 is bijective and path-safe.
+// base64url over UTF-8 is bijective and path-safe; the `~` prefix marks the
+// codec so listSessions can ignore foreign files in the directory.
 function fileNameFor(sessionId: string): string {
 	return `~${Buffer.from(sessionId, "utf8").toString("base64url")}.jsonl`;
 }
 
-function fileForSession(dir: string, sessionId: string): string {
-	const current = path.join(dir, fileNameFor(sessionId));
-	if (fs.existsSync(current)) return current;
-	const legacy = path.join(dir, legacyFileNameFor(sessionId));
-	return fs.existsSync(legacy) ? legacy : current;
-}
-
 function sessionIdForFile(name: string): string | null {
 	const stem = name.slice(0, -".jsonl".length);
-	if (!stem.startsWith("~")) {
-		return stem.replace(/%([0-9a-f]{2})/g, (_, hex) =>
-			String.fromCharCode(Number.parseInt(hex, 16)),
-		);
-	}
+	if (!stem.startsWith("~")) return null;
 	const encoded = stem.slice(1);
 	const decoded = Buffer.from(encoded, "base64url").toString("utf8");
 	return Buffer.from(decoded, "utf8").toString("base64url") === encoded ? decoded : null;
@@ -99,7 +82,7 @@ export function fileStorage(dir = "./.agentic"): StorageProvider {
 
 	return {
 		append(sessionId, event) {
-			const file = fileForSession(dir, sessionId);
+			const file = path.join(dir, fileNameFor(sessionId));
 			const encoded = encodeEvent(event);
 			const prev = appendChains.get(sessionId) ?? Promise.resolve();
 			const next = prev.then(() => fsp.appendFile(file, `${encoded}\n`, "utf8"));
@@ -112,7 +95,7 @@ export function fileStorage(dir = "./.agentic"): StorageProvider {
 			return next;
 		},
 		async load(sessionId) {
-			const file = fileForSession(dir, sessionId);
+			const file = path.join(dir, fileNameFor(sessionId));
 			let text: string;
 			try {
 				text = await fsp.readFile(file, "utf8");

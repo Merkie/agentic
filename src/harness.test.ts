@@ -158,13 +158,16 @@ describe("extractStepUsage (is_byok classification)", () => {
 describe("replaySession", () => {
 	it("rebuilds messages, detects interrupted runs, resets context on compaction", () => {
 		const events: StoredEvent[] = [
-			{ type: "user-message", at: "t", message: { role: "user", content: "hi" } },
+			{ type: "user-message", at: "t", id: "u-1", message: { role: "user", content: "hi" } },
 			{ type: "run-start", at: "t", runId: "r1", model: "m" },
 			{
 				type: "step",
 				at: "t",
 				runId: "r1",
 				messages: stored({ role: "assistant", content: "hello" }),
+				inputMessageIds: ["u-1"],
+				inputQueueIds: [],
+				acknowledgesInput: true,
 				finishReason: "stop",
 				usage: usage(),
 			},
@@ -175,7 +178,7 @@ describe("replaySession", () => {
 				messages: stored({ role: "user", content: "<summary>" }),
 				usage: usage({ inputTokens: 5000, cost: 0.002, billedCost: 0.002 }),
 			},
-			{ type: "user-message", at: "t", message: { role: "user", content: "again" } },
+			{ type: "user-message", at: "t", id: "u-2", message: { role: "user", content: "again" } },
 			{ type: "run-start", at: "t", runId: "r2", model: "m" },
 		];
 		const replayed = replaySession(events);
@@ -192,12 +195,16 @@ describe("replaySession", () => {
 			at: "t",
 			runId: "r1",
 			messages: stored({ role: "assistant", content: "hello" }),
+			inputMessageIds: ["u-hi"],
+			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "stop",
 			usage: usage(),
 		};
 		const user = (content: string): StoredEvent => ({
 			type: "user-message",
 			at: "t",
+			id: `u-${content}`,
 			message: { role: "user", content },
 		});
 
@@ -245,11 +252,12 @@ describe("replaySession", () => {
 
 	it("keeps a queued message pending until a causal step includes its queue id", () => {
 		const events: StoredEvent[] = [
-			{ type: "user-message", at: "t0", message: { role: "user", content: "A" } },
+			{ type: "user-message", at: "t0", id: "u-a", message: { role: "user", content: "A" } },
 			{ type: "run-start", at: "t1", runId: "r1", model: "m" },
 			{
 				type: "user-message",
 				at: "t2",
+				id: "q-b",
 				message: { role: "user", content: "B" },
 				meta: { queued: true, queueId: "q-b" },
 			},
@@ -258,7 +266,9 @@ describe("replaySession", () => {
 				at: "t3",
 				runId: "r1",
 				messages: stored({ role: "assistant", content: "answer to A" }),
+				inputMessageIds: ["u-a"],
 				inputQueueIds: [],
+				acknowledgesInput: true,
 				finishReason: "stop",
 				usage: usage(),
 			},
@@ -277,7 +287,9 @@ describe("replaySession", () => {
 				at: "t6",
 				runId: "r2",
 				messages: stored({ role: "assistant", content: "answer to B" }),
+				inputMessageIds: ["q-b"],
 				inputQueueIds: ["q-b"],
+				acknowledgesInput: true,
 				finishReason: "stop",
 				usage: usage(),
 			},
@@ -292,6 +304,7 @@ describe("replaySession", () => {
 			{
 				type: "user-message",
 				at: "t0",
+				id: "q-1",
 				message: { role: "user", content: "queued" },
 				meta: { queued: true, queueId: "q-1" },
 			},
@@ -309,6 +322,7 @@ describe("replaySession", () => {
 			{
 				type: "user-message",
 				at: "t0",
+				id: "u-1",
 				message: { role: "user", content: "ordinary input" },
 				meta: { queueId: "domain-id" },
 			},
@@ -347,6 +361,7 @@ describe("memoryStorage", () => {
 		await storage.append("s", {
 			type: "user-message",
 			at: "t",
+			id: "u-1",
 			message: { role: "user", content: "1" },
 		});
 		await storage.append("s", { type: "run-start", at: "t", runId: "r", model: "m" });
@@ -489,6 +504,7 @@ describe("validated tasks", () => {
 		await storage.append("interrupted-task", {
 			type: "user-message",
 			at: "t0",
+			id: "u-1",
 			message: { role: "user", content: "finish this" },
 		});
 		await storage.append("interrupted-task", {
@@ -572,7 +588,9 @@ describe("validated tasks", () => {
 					],
 				},
 			),
+			inputMessageIds: [],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "tool-calls",
 			usage: usage(),
 		});
@@ -648,7 +666,9 @@ describe("validated tasks", () => {
 					],
 				},
 			),
+			inputMessageIds: [],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "tool-calls",
 			usage: usage(),
 		});
@@ -691,6 +711,7 @@ describe("ledger durability", () => {
 		await storage.append("storage-failure", {
 			type: "user-message",
 			at: "t0",
+			id: "u-1",
 			message: { role: "user", content: "hello" },
 		});
 		const model = new MockLanguageModelV3({
@@ -737,6 +758,7 @@ describe("ledger durability", () => {
 		await storage.append("tool-choice", {
 			type: "user-message",
 			at: "t0",
+			id: "u-1",
 			message: { role: "user", content: "use a tool" },
 		});
 		let receivedToolChoice: unknown;
@@ -783,6 +805,7 @@ describe("ledger durability", () => {
 		await storage.append("visible-partial", {
 			type: "user-message",
 			at: "t0",
+			id: "u-1",
 			message: { role: "user", content: "answer once" },
 		});
 		let calls = 0;
@@ -1068,6 +1091,7 @@ describe("explicit cancellation durability", () => {
 		await base.append(sessionId, {
 			type: "user-message",
 			at: "t0",
+			id: "q-before-stream",
 			message: { role: "user", content: "queued work" },
 			meta: { queued: true, queueId: "q-before-stream" },
 		});
@@ -1704,6 +1728,7 @@ describe("explicit cancellation durability", () => {
 		await storage.append("cancel-auto-resume", {
 			type: "user-message",
 			at: "t0",
+			id: "u-1",
 			message: { role: "user", content: "hello" },
 		});
 		await storage.append("cancel-auto-resume", {
@@ -1717,6 +1742,7 @@ describe("explicit cancellation durability", () => {
 			at: "t2",
 			runId: "cancelled-run",
 			messages: stored({ role: "assistant", content: "kept" }),
+			inputMessageIds: ["u-1"],
 			inputQueueIds: [],
 			acknowledgesInput: true,
 			finishReason: "cancelled",
@@ -1762,6 +1788,7 @@ describe("explicit cancellation durability", () => {
 		await storage.append("cancel-resumed-task", {
 			type: "user-message",
 			at: "t0",
+			id: "u-1",
 			message: { role: "user", content: "do work" },
 		});
 		await storage.append("cancel-resumed-task", {
@@ -1775,6 +1802,7 @@ describe("explicit cancellation durability", () => {
 			at: "t2",
 			runId: "cancelled-task-run",
 			messages: stored({ role: "assistant", content: "partial task work" }),
+			inputMessageIds: ["u-1"],
 			inputQueueIds: [],
 			acknowledgesInput: true,
 			finishReason: "cancelled",
@@ -1924,6 +1952,7 @@ describe("compaction with pending inputs", () => {
 		await storage.append(sessionId, {
 			type: "user-message",
 			at: "t0",
+			id: "u-old",
 			message: { role: "user", content: "old question" },
 		});
 		await storage.append(sessionId, {
@@ -1931,7 +1960,9 @@ describe("compaction with pending inputs", () => {
 			at: "t1",
 			runId: "old",
 			messages: stored({ role: "assistant", content: "old answer" }),
+			inputMessageIds: ["u-old"],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "stop",
 			usage: usage({ inputTokens: 60, outputTokens: 20, totalTokens: 80 }),
 		});
@@ -1944,6 +1975,7 @@ describe("compaction with pending inputs", () => {
 		await storage.append(sessionId, {
 			type: "user-message",
 			at: "t3",
+			id: queued ? "q-current" : "u-current",
 			message: { role: "user", content: "current question" },
 			...(queued ? { meta: { queued: true, queueId: "q-current" } } : {}),
 		});
@@ -1965,19 +1997,13 @@ describe("compaction with pending inputs", () => {
 		const compaction = events.find(
 			(event): event is Extract<StoredEvent, { type: "compaction" }> => event.type === "compaction",
 		);
-		if (queued) {
-			// The queued input has a ledger id (its queueId), so replay re-links it
-			// by id — no legacy index pair is written.
-			expect(compaction?.pendingInputs).toBeUndefined();
-			expect(
-				compaction?.messages.find((entry) =>
-					JSON.stringify(entry.message.content).includes("current question"),
-				)?.id,
-			).toBe("q-current");
-		} else {
-			// A pre-v0.7 id-less pending input still gets the legacy index pair.
-			expect(compaction?.pendingInputs).toEqual([{ pendingIndex: 0, messageIndex: 1 }]);
-		}
+		// The pending input keeps its ledger id in the rebased base, so replay
+		// re-links it by id.
+		expect(
+			compaction?.messages.find((entry) =>
+				JSON.stringify(entry.message.content).includes("current question"),
+			)?.id,
+		).toBe(queued ? "q-current" : "u-current");
 		const replayed = replaySession(events);
 		expect(replayed.pendingMessages).toBe(0);
 		expect(
@@ -1999,6 +2025,7 @@ describe("compaction with pending inputs", () => {
 		await storage.append(sessionId, {
 			type: "user-message",
 			at: "t0",
+			id: "u-old",
 			message: { role: "user", content: "old question" },
 		});
 		await storage.append(sessionId, {
@@ -2006,7 +2033,9 @@ describe("compaction with pending inputs", () => {
 			at: "t1",
 			runId: "old",
 			messages: stored({ role: "assistant", content: "old answer" }),
+			inputMessageIds: ["u-old"],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "stop",
 			usage: usage({ inputTokens: 10, outputTokens: 5, totalTokens: 15 }),
 		});
@@ -2019,6 +2048,7 @@ describe("compaction with pending inputs", () => {
 		await storage.append(sessionId, {
 			type: "user-message",
 			at: "t3",
+			id: "u-current",
 			message: { role: "user", content: "current forced question" },
 		});
 		let streamCall = 0;
@@ -2066,6 +2096,7 @@ describe("compaction with pending inputs", () => {
 		await storage.append(sessionId, {
 			type: "user-message",
 			at: "t0",
+			id: "u-old",
 			message: { role: "user", content: "old question" },
 		});
 		await storage.append(sessionId, {
@@ -2073,7 +2104,9 @@ describe("compaction with pending inputs", () => {
 			at: "t1",
 			runId: "old",
 			messages: stored({ role: "assistant", content: "old answer" }),
+			inputMessageIds: ["u-old"],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "stop",
 			usage: usage({ inputTokens: 60, outputTokens: 20, totalTokens: 80 }),
 		});
@@ -2086,6 +2119,7 @@ describe("compaction with pending inputs", () => {
 		await storage.append(sessionId, {
 			type: "user-message",
 			at: "t3",
+			id: "q-cancelled-compaction",
 			message: { role: "user", content: "queued question" },
 			meta: { queued: true, queueId: "q-cancelled-compaction" },
 		});
@@ -2310,6 +2344,7 @@ describe("message queueing", () => {
 		await storage.append(sessionId, {
 			type: "user-message",
 			at: "t0",
+			id: "u-first",
 			message: { role: "user", content: "first question" },
 		});
 
@@ -2326,6 +2361,7 @@ describe("message queueing", () => {
 					await storage.append(sessionId, {
 						type: "user-message",
 						at: "t1",
+						id: "q-1",
 						message: { role: "user", content: "second question" },
 						meta: { queued: true, queueId: "q-1" },
 					});
@@ -3005,6 +3041,7 @@ describe("message queueing", () => {
 		await storage.append("queue-restart", {
 			type: "user-message",
 			at: "t0",
+			id: "u-a",
 			message: { role: "user", content: "A" },
 		});
 		await storage.append("queue-restart", {
@@ -3016,6 +3053,7 @@ describe("message queueing", () => {
 		await storage.append("queue-restart", {
 			type: "user-message",
 			at: "t2",
+			id: "q-b",
 			message: { role: "user", content: "B" },
 			meta: { queued: true, queueId: "q-b" },
 		});
@@ -3024,7 +3062,9 @@ describe("message queueing", () => {
 			at: "t3",
 			runId: "r1",
 			messages: stored({ role: "assistant", content: "answer to A" }),
+			inputMessageIds: ["u-a"],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "stop",
 			usage: usage(),
 		});
@@ -3069,6 +3109,7 @@ describe("message queueing", () => {
 		await storage.append("queue-late-signal", {
 			type: "user-message",
 			at: "t0",
+			id: "u-a",
 			message: { role: "user", content: "A" },
 		});
 		let calls = 0;
@@ -3079,12 +3120,14 @@ describe("message queueing", () => {
 					await storage.append("queue-late-signal", {
 						type: "user-message",
 						at: "t1",
+						id: "q-b",
 						message: { role: "user", content: "B" },
 						meta: { queued: true, queueId: "q-b" },
 					});
 					await storage.append("queue-late-signal", {
 						type: "user-message",
 						at: "t2",
+						id: "q-x",
 						message: { role: "user", content: "X" },
 						meta: { queued: true, queueId: "q-x" },
 					});
@@ -3123,6 +3166,7 @@ describe("message queueing", () => {
 		await storage.append(sessionId, {
 			type: "user-message",
 			at: "t0",
+			id: "u-weather",
 			message: { role: "user", content: "weather in san antonio and houston" },
 		});
 
@@ -3138,6 +3182,7 @@ describe("message queueing", () => {
 					await storage.append(sessionId, {
 						type: "user-message",
 						at: "t1",
+						id: "q-1",
 						message: { role: "user", content: "then email it to me" },
 						meta: { queued: true, queueId: "q-1" },
 					});
@@ -3230,6 +3275,7 @@ describe("crash-window finalization", () => {
 		await storage.append(sessionId, {
 			type: "user-message",
 			at: "t0",
+			id: "u-a",
 			message: { role: "user", content: "A" },
 		});
 		await storage.append(sessionId, {
@@ -3243,7 +3289,9 @@ describe("crash-window finalization", () => {
 			at: "t2",
 			runId: "r1",
 			messages: stored({ role: "assistant", content: "answer to A" }),
+			inputMessageIds: ["u-a"],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason,
 			usage: usage(),
 		});
@@ -3280,6 +3328,7 @@ describe("crash-window finalization", () => {
 		await storage.append("textless-finalize", {
 			type: "user-message",
 			at: "t0",
+			id: "u-old",
 			message: { role: "user", content: "old question" },
 		});
 		await storage.append("textless-finalize", {
@@ -3293,7 +3342,9 @@ describe("crash-window finalization", () => {
 			at: "t2",
 			runId: "old-run",
 			messages: stored({ role: "assistant", content: "stale old answer" }),
+			inputMessageIds: ["u-old"],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "stop",
 			usage: usage(),
 		});
@@ -3306,6 +3357,7 @@ describe("crash-window finalization", () => {
 		await storage.append("textless-finalize", {
 			type: "user-message",
 			at: "t4",
+			id: "u-current",
 			message: { role: "user", content: "current question" },
 		});
 		await storage.append("textless-finalize", {
@@ -3319,7 +3371,9 @@ describe("crash-window finalization", () => {
 			at: "t6",
 			runId: "current-run",
 			messages: stored({ role: "assistant", content: "" }),
+			inputMessageIds: ["u-current"],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "stop",
 			usage: usage(),
 		});
@@ -3522,6 +3576,7 @@ describe("auto-resume", () => {
 		await storage.append("crashed", {
 			type: "user-message",
 			at: "t0",
+			id: "u-1",
 			message: { role: "user", content: "count to three" },
 		});
 		await storage.append("crashed", {
@@ -3535,6 +3590,9 @@ describe("auto-resume", () => {
 			at: "t2",
 			runId: "r1",
 			messages: stored({ role: "assistant", content: "one…" }),
+			inputMessageIds: ["u-1"],
+			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "tool-calls",
 			usage: usage(),
 		});
@@ -3576,6 +3634,7 @@ describe("auto-resume", () => {
 		await storage.append("cancel-auto-resumed-live", {
 			type: "user-message",
 			at: "t0",
+			id: "u-1",
 			message: { role: "user", content: "continue after restart" },
 		});
 		await storage.append("cancel-auto-resumed-live", {
@@ -3645,6 +3704,7 @@ describe("auto-resume", () => {
 		await storage.append("orphan", {
 			type: "user-message",
 			at: "t0",
+			id: "q-1",
 			message: { role: "user", content: "what is 6*7?" },
 			meta: { queued: true, queueId: "q-1" },
 		});
@@ -3707,6 +3767,7 @@ describe("auto-resume", () => {
 		await storage.append("queued-give-up", {
 			type: "user-message",
 			at: "t0",
+			id: "q-1",
 			message: { role: "user", content: "keep me" },
 			meta: { queued: true, queueId: "q-1" },
 		});
@@ -3773,6 +3834,7 @@ describe("auto-resume", () => {
 			await storage.append(`concurrent-${configured ?? "default"}-${index}`, {
 				type: "user-message",
 				at: "t0",
+				id: "u-resume",
 				message: { role: "user", content: "resume me" },
 			});
 		}
@@ -3803,6 +3865,7 @@ describe("auto-resume", () => {
 			await storage.append(`racing-sweep-${index}`, {
 				type: "user-message",
 				at: "t0",
+				id: "u-resume",
 				message: { role: "user", content: "resume me" },
 			});
 		}
@@ -3931,31 +3994,6 @@ describe("message identity", () => {
 		expect(liveStep?.messages.map((entry) => entry.id)).toEqual([messages[1].id]);
 	});
 
-	it("replays a pre-v0.7 ledger: null ids for plain messages, inputId honored", () => {
-		const legacyStep = {
-			type: "step",
-			at: "t1",
-			runId: "r1",
-			messages: [{ role: "assistant", content: "old" }],
-			finishReason: "stop",
-			usage: usage(),
-		} as unknown as StoredEvent;
-		const replayed = replaySession([
-			{
-				type: "user-message",
-				at: "t0",
-				message: { role: "user", content: "hi" },
-				inputId: "legacy-input",
-			},
-			{ type: "run-start", at: "t0", runId: "r1", model: "m" },
-			legacyStep,
-			{ type: "run-end", at: "t2", runId: "r1", status: "completed" },
-		]);
-		expect(replayed.messages.map((entry) => entry.id)).toEqual(["legacy-input", null]);
-		expect(replayed.messages.map((entry) => entry.at)).toEqual(["t0", "t1"]);
-		expect(replayed.messages.map((entry) => entry.message.content)).toEqual(["hi", "old"]);
-	});
-
 	it("keeps retained ids and times across compaction; the summary gets a fresh id", async () => {
 		const modelId = "mock/identity-compaction";
 		setContextWindow(modelId, 100);
@@ -3972,7 +4010,9 @@ describe("message identity", () => {
 			at: "t1",
 			runId: "old",
 			messages: [{ id: "a-old", message: { role: "assistant", content: "old answer" } }],
+			inputMessageIds: ["u-old"],
 			inputQueueIds: [],
+			acknowledgesInput: true,
 			finishReason: "stop",
 			usage: usage({ inputTokens: 60, outputTokens: 20, totalTokens: 80 }),
 		});
@@ -4021,7 +4061,6 @@ describe("message identity", () => {
 		expect(retainedEntry?.at).toBe("t3");
 		expect(typeof summaryEntry?.id).toBe("string");
 		expect(["u-old", "a-old", "u-current"]).not.toContain(summaryEntry?.id);
-		expect(compaction?.pendingInputs).toBeUndefined();
 
 		const replayed = replaySession(events);
 		expect(replayed.pendingMessages).toBe(0);

@@ -6,7 +6,7 @@ import { classifyFailure, serializeError } from "./failure.js";
 import { logEvents } from "./logEvents.js";
 import { getContextWindow } from "./modelMeta.js";
 import { createOpenRouter } from "./openrouter.js";
-import { normalizeStoredMessages, type ReplayedSession, replaySession } from "./replay.js";
+import { type ReplayedSession, replaySession } from "./replay.js";
 import { createResilientFetch, type ResilientFetchOptions } from "./resilientFetch.js";
 import { createMailbox, type RunLoopOptions, runLoop } from "./run.js";
 import { fileStorage, memoryStorage, serializedStorage } from "./storage.js";
@@ -1053,11 +1053,7 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 // user-message event without having seen it.
 function queueAnsweredByRun(events: StoredEvent[], queueId: string): string | null {
 	for (const event of events) {
-		if (
-			event.type === "step" &&
-			event.acknowledgesInput !== false &&
-			event.inputQueueIds?.includes(queueId)
-		) {
+		if (event.type === "step" && event.acknowledgesInput && event.inputQueueIds.includes(queueId)) {
 			return event.runId;
 		}
 	}
@@ -1079,7 +1075,7 @@ function lastAssistantTextForRun(events: StoredEvent[], runId: string): string {
 	return lastAssistantText(
 		events.flatMap((event) =>
 			event.type === "step" && event.runId === runId
-				? normalizeStoredMessages(event.messages, event.at).map((stored) => stored.message)
+				? event.messages.map((stored) => stored.message)
 				: [],
 		),
 	);

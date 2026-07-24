@@ -35,7 +35,7 @@ export {
 	projectRun,
 	type RunProjectionStatus,
 } from "./projection.js";
-export { normalizeStoredMessages, type ReplayedSession, replaySession } from "./replay.js";
+export { type ReplayedSession, replaySession } from "./replay.js";
 export {
 	createResilientFetch,
 	HeaderTimeoutError,

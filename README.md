@@ -139,8 +139,8 @@ and the live `step` event carries the same identified messages the ledger
 recorded, so a UI can reconcile its streamed draft against durable identities
 without reloading. `RunResult` names the run that produced it (`runId`), so a
 resolved `send()`/`resume()` correlates directly with run/step events and
-their messages. Ledgers written before v0.7 still replay; their messages just
-come back with `id: null`.
+their messages. v0.8 requires ledgers written by v0.7 or later; pre-v0.7
+session data is unsupported and fails to load with a descriptive error.
 
 Queued-input causality is recorded on each `step`; raw append order alone is
 not a transcript (an in-flight step can be persisted after a newly arrived

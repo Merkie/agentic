@@ -123,40 +123,4 @@ describe("projectRun", () => {
 		]);
 		expect(projected?.pendingInputs).toEqual([]);
 	});
-
-	it("deduplicates cumulative legacy step snapshots", () => {
-		const first = {
-			type: "step",
-			at: "t2",
-			runId: "run",
-			inputQueueIds: [],
-			finishReason: "tool-calls",
-			usage,
-			messages: [{ role: "assistant", content: "first" }],
-		} as unknown as StoredEvent;
-		const second = {
-			...first,
-			at: "t3",
-			finishReason: "stop",
-			messages: [
-				{ role: "assistant", content: "first" },
-				{ role: "assistant", content: "second" },
-			],
-		} as unknown as StoredEvent;
-		const projected = projectRun(
-			[
-				{ type: "user-message", at: "t0", message: { role: "user", content: "A" } },
-				{ type: "run-start", at: "t1", runId: "run", model: "model" },
-				first,
-				second,
-				{ type: "run-end", at: "t4", runId: "run", status: "completed" },
-			],
-			"run",
-		);
-
-		expect(projected?.segments[0]?.messages.map((message) => message.message.content)).toEqual([
-			"first",
-			"second",
-		]);
-	});
 });

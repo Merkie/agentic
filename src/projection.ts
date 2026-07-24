@@ -1,11 +1,10 @@
-import { normalizeStoredMessages } from "./replay.js";
 import type { SerializedError, SessionMessage, StoredEvent } from "./types.js";
 
 export type RunProjectionStatus = "running" | "completed" | "cancelled" | "failed";
 
 /** A durable user input associated with a projected response segment. */
 export interface ProjectedInput extends SessionMessage {
-	/** Position in the supplied ledger, useful as a stable legacy fallback. */
+	/** Position in the supplied ledger. */
 	eventIndex: number;
 	meta?: Record<string, unknown>;
 	queued: boolean;
@@ -52,7 +51,7 @@ function inputOf(
 ): IndexedInput {
 	const queueId = queueIdOf(event);
 	return {
-		id: event.id ?? event.inputId ?? queueId,
+		id: event.id,
 		at: event.at,
 		message: event.message,
 		eventIndex,
@@ -63,38 +62,14 @@ function inputOf(
 	};
 }
 
-function sameMessage(a: SessionMessage, b: SessionMessage): boolean {
-	if (a.id !== null && b.id !== null) return a.id === b.id;
-	try {
-		return JSON.stringify(a.message) === JSON.stringify(b.message);
-	} catch {
-		return a.message === b.message;
-	}
-}
-
-/**
- * Some pre-v0.7 adapters persisted cumulative step snapshots. Current Agentic
- * ledgers persist only the step's new response messages. Normalize both forms
- * so a projection never duplicates an earlier assistant/tool message.
- */
-function newStepMessages(previous: SessionMessage[], current: SessionMessage[]): SessionMessage[] {
-	const extendsPrevious =
-		previous.length <= current.length &&
-		previous.every((message, index) => {
-			const candidate = current[index];
-			return candidate !== undefined && sameMessage(message, candidate);
-		});
-	return extendsPrevious ? current.slice(previous.length) : current;
-}
-
 /**
  * Reconstruct the user-input/assistant-response boundaries for one durable run.
  *
  * This is the package-level API storage adapters should use for a UI/chat
  * projection. It understands queued sends, step acknowledgement, interrupted
- * runs, causal ordering, legacy ledgers, and cumulative legacy step snapshots.
- * Adapters remain responsible only for choosing which model messages are
- * visible and writing the returned projection to their database.
+ * runs, and causal ordering. Adapters remain responsible only for choosing
+ * which model messages are visible and writing the returned projection to
+ * their database.
  */
 export function projectRun(events: StoredEvent[], runId: string): ProjectedRun | null {
 	const startIndex = events.findIndex(
@@ -125,12 +100,7 @@ export function projectRun(events: StoredEvent[], runId: string): ProjectedRun |
 		const event = events[index];
 		if (event?.type === "user-message") allInputs.push(inputOf(event, index));
 	}
-	const byId = new Map(
-		allInputs.flatMap((input) => (input.id === null ? [] : [[input.id, input] as const])),
-	);
-	const byQueueId = new Map(
-		allInputs.flatMap((input) => (input.queueId === null ? [] : [[input.queueId, input] as const])),
-	);
+	const byId = new Map(allInputs.map((input) => [input.id, input] as const));
 	const relevantInputIndexes = new Set(
 		allInputs
 			.filter((input) => input.eventIndex > previousEndIndex)
@@ -142,12 +112,8 @@ export function projectRun(events: StoredEvent[], runId: string): ProjectedRun |
 	for (let index = startIndex + 1; index < limit; index += 1) {
 		const event = events[index];
 		if (event?.type !== "step" || event.runId !== runId) continue;
-		for (const id of event.inputMessageIds ?? []) {
+		for (const id of event.inputMessageIds) {
 			const input = byId.get(id);
-			if (input) relevantInputIndexes.add(input.eventIndex);
-		}
-		for (const id of event.inputQueueIds ?? []) {
-			const input = byQueueId.get(id);
 			if (input) relevantInputIndexes.add(input.eventIndex);
 		}
 	}
@@ -156,7 +122,6 @@ export function projectRun(events: StoredEvent[], runId: string): ProjectedRun |
 	type MutableSegment = Omit<ProjectedRunSegment, "status">;
 	const segments: MutableSegment[] = [];
 	let current: MutableSegment | null = null;
-	let previousSnapshot: SessionMessage[] = [];
 	let lastStepIndex = startIndex;
 
 	const beginOrExtend = (included: IndexedInput[]): MutableSegment => {
@@ -183,26 +148,11 @@ export function projectRun(events: StoredEvent[], runId: string): ProjectedRun |
 		lastStepIndex = index;
 
 		let included: IndexedInput[] = [];
-		if (event.acknowledgesInput !== false) {
-			if (event.inputMessageIds !== undefined) {
-				included = event.inputMessageIds.flatMap((id) => {
-					const input = byId.get(id);
-					return input && input.eventIndex < index ? [input] : [];
-				});
-			} else if (event.inputQueueIds !== undefined) {
-				const queued = event.inputQueueIds.flatMap((id) => {
-					const input = byQueueId.get(id);
-					return input && input.eventIndex < index ? [input] : [];
-				});
-				included = [
-					...inputs.filter((input) => !input.queued && input.eventIndex < index),
-					...queued,
-				].sort((a, b) => a.eventIndex - b.eventIndex);
-			} else {
-				// Old ledgers had no causal membership: a successful step settled all
-				// user input sequenced before it.
-				included = inputs.filter((input) => input.eventIndex < index);
-			}
+		if (event.acknowledgesInput) {
+			included = event.inputMessageIds.flatMap((id) => {
+				const input = byId.get(id);
+				return input && input.eventIndex < index ? [input] : [];
+			});
 			for (const input of included) input.settled = true;
 		} else if (!current) {
 			// An error step cannot claim a queued message that arrived in flight.
@@ -211,11 +161,15 @@ export function projectRun(events: StoredEvent[], runId: string): ProjectedRun |
 		}
 
 		const segment = beginOrExtend(included);
-		const snapshot = normalizeStoredMessages(event.messages, event.at);
-		segment.messages.push(...newStepMessages(previousSnapshot, snapshot));
+		segment.messages.push(
+			...event.messages.map((stored) => ({
+				id: stored.id,
+				at: stored.at ?? event.at,
+				message: stored.message,
+			})),
+		);
 		segment.at = event.at;
 		segment.finishReason = event.finishReason;
-		previousSnapshot = snapshot;
 	}
 
 	if (segments.length === 0) {

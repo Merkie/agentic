@@ -76,18 +76,69 @@ function reviveBinary(this: unknown, key: string, value: unknown): unknown {
 	return new Uint8Array(decoded);
 }
 
+const SCHEMA_VERSION = 1;
+
+// The wire difference between v1 and what predates the version field is
+// identity: v0.7 (which wrote no `v`) already produced every id v1 requires;
+// pre-v0.7 ledgers did not. Only identity is checked — the events themselves
+// are trusted, this is a version probe, not a schema validator.
+function isV1Shape(event: StoredEvent): boolean {
+	switch (event.type) {
+		case "user-message":
+			return typeof event.id === "string";
+		case "step":
+			return (
+				Array.isArray(event.inputQueueIds) &&
+				typeof event.acknowledgesInput === "boolean" &&
+				Array.isArray(event.messages) &&
+				event.messages.every((entry) => typeof entry?.id === "string")
+			);
+		case "compaction":
+			return (
+				!("pendingInputs" in event) &&
+				Array.isArray(event.messages) &&
+				event.messages.every((entry) => typeof entry?.id === "string")
+			);
+		default:
+			return true;
+	}
+}
+
 /**
  * Serialize a ledger event without losing Uint8Array, Buffer, or ArrayBuffer
  * values carried by multimodal message parts. Adapter authors should use this
  * rather than plain JSON.stringify when persisting StoredEvent values.
+ * Stamps the event schema version (`v`).
  */
 export function encodeEvent(event: StoredEvent): string {
-	const encoded = JSON.stringify(event, eventReplacer());
+	const encoded = JSON.stringify({ ...event, v: SCHEMA_VERSION }, eventReplacer());
 	if (encoded === undefined) throw new TypeError("StoredEvent could not be serialized");
 	return encoded;
 }
 
-/** Decode a ledger event serialized by {@link encodeEvent}. */
+/**
+ * Decode a ledger event serialized by {@link encodeEvent}. The single schema
+ * normalization point: every reader (replay, projection, the run loop) may
+ * assume a valid v1 event after this returns. A future v2 becomes a one-time
+ * migration here, never shape-sniffing in readers.
+ */
 export function decodeEvent(json: string): StoredEvent {
-	return JSON.parse(json, reviveBinary) as StoredEvent;
+	const event = JSON.parse(json, reviveBinary) as StoredEvent;
+	if (event.v === undefined) {
+		// v0.7 predates the version field but already wrote v1 shapes — stamp
+		// them. Anything else unversioned predates message identity entirely.
+		if (!isV1Shape(event)) {
+			throw new Error(
+				`Unsupported ledger event ("${event.type}" without message identity): this session's data was written before agentic v0.7. Pre-v0.7 session data is unsupported.`,
+			);
+		}
+		event.v = SCHEMA_VERSION;
+		// v0.7's cancellation step omitted an empty input membership.
+		if (event.type === "step" && event.inputMessageIds === undefined) event.inputMessageIds = [];
+	} else if (event.v !== SCHEMA_VERSION) {
+		throw new Error(
+			`Unknown ledger event schema version ${event.v} (this agentic reads v${SCHEMA_VERSION}): the session was written by a newer agentic release.`,
+		);
+	}
+	return event;
 }

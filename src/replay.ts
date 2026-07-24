@@ -1,6 +1,6 @@
 import type { ModelMessage } from "ai";
 import { sanitizeConversation } from "./sanitize.js";
-import type { SessionMessage, StoredEvent, StoredMessage, UsageTotals } from "./types.js";
+import type { SessionMessage, StoredEvent, UsageTotals } from "./types.js";
 import { addStepToTotals, emptyTotals } from "./usage.js";
 
 // Identity rides through replay on symbol tags so sanitizeConversation's
@@ -10,11 +10,11 @@ const MESSAGE_ID = Symbol("agenticMessageId");
 const MESSAGE_AT = Symbol("agenticMessageAt");
 
 type TaggedMessage = ModelMessage & {
-	[MESSAGE_ID]?: string | null;
+	[MESSAGE_ID]?: string;
 	[MESSAGE_AT]?: string;
 };
 
-function tagMessage(message: ModelMessage, id: string | null, at: string): TaggedMessage {
+function tagMessage(message: ModelMessage, id: string, at: string): TaggedMessage {
 	return { ...message, [MESSAGE_ID]: id, [MESSAGE_AT]: at };
 }
 
@@ -22,35 +22,19 @@ function untagMessage(tagged: TaggedMessage): SessionMessage {
 	const message = { ...tagged };
 	delete message[MESSAGE_ID];
 	delete message[MESSAGE_AT];
+	// Every replayed message goes through tagMessage, so the fallbacks are for
+	// the type system only.
 	return {
-		id: tagged[MESSAGE_ID] ?? null,
+		id: tagged[MESSAGE_ID] ?? "",
 		at: tagged[MESSAGE_AT] ?? "",
 		message: message as ModelMessage,
 	};
 }
 
-/**
- * Read an event's message list in either ledger shape: v0.7+ StoredMessage
- * envelopes, or pre-v0.7 plain ModelMessage elements (id null, time from the
- * carrying event).
- */
-export function normalizeStoredMessages(
-	messages: Array<StoredMessage | ModelMessage>,
-	eventAt: string,
-): Array<{ id: string | null; at: string; message: ModelMessage }> {
-	return messages.map((element) => {
-		if (element !== null && typeof element === "object" && "role" in element) {
-			return { id: null, at: eventAt, message: element };
-		}
-		const stored = element as StoredMessage;
-		return { id: stored.id ?? null, at: stored.at ?? eventAt, message: stored.message };
-	});
-}
-
 interface PendingInput {
 	queueId: string | null;
-	/** The ledger message id, when the event carried one (always, since v0.7). */
-	messageId: string | null;
+	/** The ledger message id. */
+	messageId: string;
 	/** Live reference into the working conversation, for causal reordering. */
 	tagged: TaggedMessage;
 }
@@ -115,58 +99,42 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 				const rawQueueId = event.meta?.queueId;
 				const queueId =
 					event.meta?.queued === true && typeof rawQueueId === "string" ? rawQueueId : null;
-				const messageId = event.id ?? event.inputId ?? queueId;
-				const tagged = tagMessage(event.message, messageId, event.at);
+				const tagged = tagMessage(event.message, event.id, event.at);
 				messages.push(tagged);
-				pendingInputs.push({ queueId, messageId, tagged });
+				pendingInputs.push({ queueId, messageId: event.id, tagged });
 				break;
 			}
 			case "step": {
-				const acknowledgesInput = event.acknowledgesInput !== false;
-				if (acknowledgesInput && event.inputQueueIds !== undefined) {
+				if (event.acknowledgesInput) {
 					const included = new Set(event.inputQueueIds);
 					moveInputsToTail(
 						messages,
 						pendingInputs.filter((input) => input.queueId === null || included.has(input.queueId)),
 					);
-				}
-				for (const stored of normalizeStoredMessages(event.messages, event.at)) {
-					messages.push(tagMessage(stored.message, stored.id, stored.at));
-				}
-				totals = addStepToTotals(totals, event.usage);
-				if (!acknowledgesInput) break;
-				if (event.inputQueueIds === undefined) {
-					// Legacy steps had no causal membership. Preserve their historical
-					// sequence-based behavior when replaying an old ledger.
-					pendingInputs = [];
-				} else {
-					const included = new Set(event.inputQueueIds);
 					pendingInputs = pendingInputs.filter(
 						(input) => input.queueId !== null && !included.has(input.queueId),
 					);
 				}
+				for (const stored of event.messages) {
+					messages.push(tagMessage(stored.message, stored.id, stored.at ?? event.at));
+				}
+				totals = addStepToTotals(totals, event.usage);
 				break;
 			}
 			case "compaction": {
-				messages = normalizeStoredMessages(event.messages, event.at).map((stored) =>
-					tagMessage(stored.message, stored.id, stored.at),
+				messages = event.messages.map((stored) =>
+					tagMessage(stored.message, stored.id, stored.at ?? event.at),
 				);
 				// Pending inputs preserved verbatim in the base must keep their exact
 				// identity: re-link each entry to its rebased message by ledger id.
 				const rebasedById = new Map<string, TaggedMessage>();
 				for (const tagged of messages) {
 					const id = tagged[MESSAGE_ID];
-					if (typeof id === "string") rebasedById.set(id, tagged);
+					if (id !== undefined) rebasedById.set(id, tagged);
 				}
 				for (const input of pendingInputs) {
-					const rebased = input.messageId ? rebasedById.get(input.messageId) : undefined;
+					const rebased = rebasedById.get(input.messageId);
 					if (rebased) input.tagged = rebased;
-				}
-				// Legacy (pre-v0.7) ledgers recorded the linkage as index pairs.
-				for (const preserved of event.pendingInputs ?? []) {
-					const input = pendingInputs[preserved.pendingIndex];
-					const rebasedMessage = messages[preserved.messageIndex];
-					if (input && rebasedMessage) input.tagged = rebasedMessage;
 				}
 				// The summarizer's cost counts toward lifetime totals, but its
 				// context size is the OLD conversation being summarized — the
@@ -211,11 +179,8 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 	const pendingInputMessages = pendingInputs.map((input) => {
 		const direct = envelopeOf.get(input.tagged);
 		if (direct) return direct;
-		if (input.messageId !== null) {
-			const byId = finalMessages.find((candidate) => candidate.id === input.messageId);
-			if (byId) return byId;
-		}
-		return untagMessage(input.tagged);
+		const byId = finalMessages.find((candidate) => candidate.id === input.messageId);
+		return byId ?? untagMessage(input.tagged);
 	});
 
 	return {

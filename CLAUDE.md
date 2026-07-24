@@ -102,8 +102,7 @@ Everything in the event stream is covered by ids, minted once at append time
 and paired with timestamps:
 
 - User messages carry `id` on their `user-message` event (for queued sends it
-  equals `meta.queueId`; pokes and task prompts get ids too). `inputId` is the
-  legacy pre-v0.7 name, still read on replay.
+  equals `meta.queueId`; pokes and task prompts get ids too).
 - Assistant/tool messages are persisted as `StoredMessage` envelopes
   (`{ id, message }`) inside `step` and `compaction` events; tool calls keep
   the AI SDK's `toolCallId` within content.
@@ -111,10 +110,9 @@ and paired with timestamps:
   `session.messages()` / `replaySession().messages` — `at` is the persisting
   event's time. Identity survives compaction: a retained tail message keeps
   its original id and `at` in the rebased base (per-message `at` on the
-  compaction envelope), and replay re-links pending inputs by id, replacing
-  the legacy `pendingInputs` index pairs (still read, only written for id-less
-  legacy pending inputs). Internally replay threads ids through
-  `sanitizeConversation` via symbol tags so clone-on-repair keeps them.
+  compaction envelope), and replay re-links pending inputs by id. Internally
+  replay threads ids through `sanitizeConversation` via symbol tags so
+  clone-on-repair keeps them.
 - Live `AgenticEvent`s all carry `at`; the live `step` event includes the
   persisted `StoredMessage[]`, and `queued-message`/`poke` carry `messageId`.
 - Steps also carry `inputMessageIds`, the complete durable input membership for
@@ -123,8 +121,11 @@ and paired with timestamps:
   queue markers or infer turns from append order.
 - `RunResult.runId` names the run that produced the result (for a queued send
   answered by another run, the run that causally answered it).
-- Pre-v0.7 ledgers replay fine (plain messages ⇒ `id: null`); pre-v0.7 *code*
-  cannot read v0.7 ledgers — that direction is the breaking change.
+- v0.8 requires ledgers written by v0.7 or later. Events carry a schema
+  version (`v: 1`), stamped by `encodeEvent`; `decodeEvent` is the single
+  validation/normalization point — it stamps well-formed unversioned (v0.7)
+  events and rejects pre-v0.7 shapes and newer-than-known versions with
+  descriptive errors. Pre-v0.7 session data is unsupported.
 
 `task({ durable: false })` runs against an isolated in-memory ledger. Use it
 for disposable presentation work that needs task validation/retries but should

@@ -68,11 +68,10 @@ export interface StoredMessage {
 
 /**
  * Replayed form of a conversation message: what {@link Session.messages} and
- * `replaySession().messages` return. `id` is null only for messages replayed
- * from a pre-v0.7 ledger, which predates message identity.
+ * `replaySession().messages` return.
  */
 export interface SessionMessage {
-	id: string | null;
+	id: string;
 	/** ISO 8601 time the message was persisted. */
 	at: string;
 	message: ModelMessage;
@@ -82,56 +81,56 @@ export interface SessionMessage {
  * The append-only event ledger. One session = one ordered list of events.
  * Replaying the list rebuilds the exact ModelMessage[] the model sees plus
  * run/audit state — this is what makes runs survive process restarts.
+ *
+ * `v` is the event schema version, stamped by `encodeEvent`. `decodeEvent`
+ * is the single validation/normalization point: it stamps well-formed
+ * unversioned events (v0.7 predates the field) and rejects pre-v0.7 shapes
+ * (missing message identity) and versions from newer agentic releases.
  */
 export type StoredEvent =
 	| {
 			type: "user-message";
 			at: string;
 			message: ModelMessage;
+			v?: 1;
 			/**
-			 * Framework-generated message identity. Always written since v0.7;
-			 * optional only so pre-v0.7 ledgers remain readable. For queued sends
-			 * this equals `meta.queueId`.
+			 * Framework-generated message identity, minted at append time. For
+			 * queued sends this equals `meta.queueId`.
 			 */
-			id?: string;
-			/** Legacy (pre-v0.7) name of `id` — read on replay, never written. */
-			inputId?: string;
+			id: string;
 			/** App-supplied tag (e.g. a poke dedup key); opaque to the framework. */
 			meta?: Record<string, unknown>;
 	  }
-	| { type: "run-start"; at: string; runId: string; model: string }
+	| { type: "run-start"; at: string; v?: 1; runId: string; model: string }
 	| {
 			type: "step";
 			at: string;
+			v?: 1;
 			runId: string;
 			/**
 			 * The step's response messages (assistant + tool), replay-ready, each
-			 * carrying its minted id. Pre-v0.7 ledgers stored plain ModelMessage
-			 * elements here; replay normalizes both shapes (legacy ⇒ id null).
+			 * carrying its minted id.
 			 */
 			messages: StoredMessage[];
 			/**
 			 * Durable ids of the user messages present in the model input that
-			 * produced this step. Unlike the legacy queue-only field below, this
-			 * covers both the initiating input and messages accepted by a live run.
-			 * Projection adapters can use it to reconstruct causal turns without
-			 * reverse-engineering ledger order.
+			 * produced this step — both the initiating input and messages accepted
+			 * by a live run. Projection adapters can use it to reconstruct causal
+			 * turns without reverse-engineering ledger order.
 			 */
-			inputMessageIds?: string[];
+			inputMessageIds: string[];
 			/**
 			 * Queued user-message ids present in the model input that produced this
 			 * step. An empty array is meaningful: this step did not see a queued
-			 * message that may have arrived while it was in flight. Optional only
-			 * for backward compatibility with ledgers written before v0.5.1.
+			 * message that may have arrived while it was in flight.
 			 */
-			inputQueueIds?: string[];
+			inputQueueIds: string[];
 			/**
 			 * False when the provider ended the step before producing a durable
 			 * response. Such a step records usage/error diagnostics but does not
 			 * settle any input; replay and recovery must keep that input pending.
-			 * Optional for ledgers written before v0.5.1, where steps settled input.
 			 */
-			acknowledgesInput?: boolean;
+			acknowledgesInput: boolean;
 			finishReason: string;
 			usage: StepUsage;
 			/**
@@ -148,25 +147,20 @@ export type StoredEvent =
 	| {
 			type: "compaction";
 			at: string;
+			v?: 1;
 			/**
 			 * The new replay base — everything before this event is superseded.
 			 * Messages retained from before the compaction keep their original id
-			 * and `at`; the summary message gets a fresh id. Pre-v0.7 ledgers
-			 * stored plain ModelMessage elements (legacy ⇒ id null).
+			 * and `at`; the summary message gets a fresh id.
 			 */
 			messages: StoredMessage[];
-			/**
-			 * Legacy (pre-v0.7): positions of still-pending queued inputs preserved
-			 * verbatim in the compacted base. Superseded by message ids, which let
-			 * replay re-link pending inputs directly — read on replay, never written.
-			 */
-			pendingInputs?: Array<{ pendingIndex: number; messageIndex: number }>;
 			usage?: StepUsage;
 	  }
 	| {
 			/** A resume re-entered interrupted work (open run or queued messages). */
 			type: "run-resume";
 			at: string;
+			v?: 1;
 			/** The interrupted run being re-entered; null when resuming queued messages only. */
 			runId: string | null;
 			/** True when the boot-time auto-resume sweep kicked it (counts toward the attempt cap). */
@@ -175,6 +169,7 @@ export type StoredEvent =
 	| {
 			type: "run-end";
 			at: string;
+			v?: 1;
 			runId: string;
 			status: "completed" | "cancelled" | "failed";
 			/** Reconciliation close: do not settle inputs appended after this run's final step. */
@@ -275,7 +270,7 @@ export type AgenticEvent =
 			/** The step's persisted messages with their minted ids — what the ledger recorded. */
 			messages: StoredMessage[];
 			/** User-message ids present in the model input for this persisted step. */
-			inputMessageIds?: string[];
+			inputMessageIds: string[];
 			toolCalls: { toolName: string; input: unknown }[];
 			text: string;
 	  }
