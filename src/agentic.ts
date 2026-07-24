@@ -42,6 +42,32 @@ export interface AutoResumeOptions {
 	/** Re-supply the agent config for a session found interrupted. */
 	agentFor: AutoResumeResolver;
 	/**
+	 * Choose how the sweep recovers a session whose replay shows an
+	 * interrupted OPEN run. Queued-only recovery never consults it — there is
+	 * no dead run to discard. Consulted under the session lock, after
+	 * reconciliation of persisted terminal intent, at most once per recovery.
+	 *
+	 * - `"resume"` (the default, also when the hook is absent): re-enter the
+	 *   run in place — the existing behavior.
+	 * - `"restart"`: void the dead run conversationally — close it with
+	 *   `run-end { status: "failed", discarded: true }`, which makes replay
+	 *   exclude its step output and return its inputs to pending — then
+	 *   re-drive those inputs in a fresh run, exactly like queued-only
+	 *   recovery. For agents whose tool state lived in process memory (a
+	 *   sandbox, a headless browser): the ledger survived the crash but the
+	 *   state didn't, so resuming in place would have the model act on
+	 *   phantom state.
+	 * - `"fail"`: close the run as failed (not discarded) with no re-drive —
+	 *   settles its initiating input, preserves unseen queued input, and
+	 *   consumes no attempt, like the give-up path.
+	 *
+	 * A restart appends the same `run-resume { auto: true }` marker a resume
+	 * does, so `maxAttempts` caps crash-looping restarts identically. A
+	 * throwing/rejecting hook is contained and treated as `"resume"`, the
+	 * safe default.
+	 */
+	onInterrupted?: (sessionId: string) => MaybePromise<"resume" | "restart" | "fail">;
+	/**
 	 * Crash-loop breaker: after this many automatic resume attempts on the
 	 * same interrupted work (counted in the ledger, so it survives restarts),
 	 * the sweep stops retrying and emits an auto-resume give-up event.
@@ -1150,6 +1176,20 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 	// cannot multiply the configured provider concurrency.
 	const activeAutoResumeKicks = new Set<Promise<void>>();
 
+	// The app's recovery verdict for an interrupted open run. A throwing or
+	// rejecting hook (and any unknown return value) is contained as "resume" —
+	// today's behavior is the safe default.
+	async function interruptVerdict(sessionId: string): Promise<"resume" | "restart" | "fail"> {
+		const hook = autoResume?.onInterrupted;
+		if (!hook) return "resume";
+		try {
+			const verdict = await hook(sessionId);
+			return verdict === "restart" || verdict === "fail" ? verdict : "resume";
+		} catch {
+			return "resume";
+		}
+	}
+
 	// The boot sweep (halo-style): find interrupted work, re-supply configs
 	// through the resolver, and re-drive each session. Kicks are concurrency-
 	// capped and optionally staggered; the returned promise settles when every
@@ -1237,6 +1277,47 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 					if (current.pendingMessages === 0) return finalized;
 					events = await storage.load(id);
 					current = replaySession(events);
+				}
+				// A run still open after reconciliation was interrupted mid-work:
+				// let the app choose the recovery. Queued-only recovery skips this
+				// (nothing to discard). Reconciliation ran first on purpose — a run
+				// with persisted terminal intent already finished; restarting it
+				// would discard a real answer.
+				if (current.interruptedRunId) {
+					const verdict = await interruptVerdict(id);
+					if (verdict !== "resume") {
+						const interruptedRunId = current.interruptedRunId;
+						const discarded = verdict === "restart";
+						const error = serializeError(
+							discarded ? "Interrupted; restarting" : "Interrupted; failed by onInterrupted",
+						);
+						await storage.append(id, {
+							type: "run-end",
+							at: new Date().toISOString(),
+							runId: interruptedRunId,
+							status: "failed",
+							...(discarded ? { discarded: true as const } : {}),
+							error,
+						});
+						emitEvent({
+							type: "run-end",
+							at: new Date().toISOString(),
+							sessionId: id,
+							runId: interruptedRunId,
+							status: "failed",
+							totals: current.totals,
+							error,
+						});
+						// "fail": the run is closed (initiating input settled, unseen
+						// queued input preserved), nothing is re-driven, and — like the
+						// give-up path — no attempt is consumed.
+						if (!discarded) return null;
+						// "restart": the discarded close returned the dead run's inputs
+						// to pending. Re-drive them exactly like queued-only recovery.
+						events = await storage.load(id);
+						current = replaySession(events);
+						if (current.pendingMessages === 0) return null;
+					}
 				}
 				await storage.append(id, {
 					type: "run-resume",

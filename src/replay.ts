@@ -92,6 +92,17 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 	let pendingInputs: PendingInput[] = [];
 	let autoResumeAttempts = 0;
 	const openRuns = new Map<string, true>();
+	// Snapshot of the working state for the currently-open run (there is at
+	// most one), so a `discarded` run-end can rewind the run's conversational
+	// contribution. Entries are cloned: compaction re-links the LIVE entries'
+	// tagged refs, and a rewind must restore the refs as of run-start/arrival.
+	let openRun: {
+		runId: string;
+		messages: TaggedMessage[];
+		pendingInputs: PendingInput[];
+		/** User messages appended while the run was open, in arrival order. */
+		arrivals: { entry: PendingInput; poke: boolean }[];
+	} | null = null;
 
 	for (const event of events) {
 		switch (event.type) {
@@ -102,6 +113,12 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 				const tagged = tagMessage(event.message, event.id, event.at);
 				messages.push(tagged);
 				pendingInputs.push({ queueId, messageId: event.id, tagged });
+				if (openRun) {
+					openRun.arrivals.push({
+						entry: { queueId, messageId: event.id, tagged },
+						poke: event.meta?.poke !== undefined,
+					});
+				}
 				break;
 			}
 			case "step": {
@@ -145,17 +162,40 @@ export function replaySession(events: StoredEvent[]): ReplayedSession {
 			}
 			case "run-start":
 				openRuns.set(event.runId, true);
+				openRun = {
+					runId: event.runId,
+					messages: [...messages],
+					pendingInputs: pendingInputs.map((input) => ({ ...input })),
+					arrivals: [],
+				};
 				break;
 			case "run-resume":
 				if (event.auto) autoResumeAttempts += 1;
 				break;
 			case "run-end":
 				openRuns.delete(event.runId);
-				// A cancelled/failed run settles its ordinary initiating message, but
-				// cannot settle queued input that no persisted step causally saw.
-				if (!event.preservePending) {
+				if (event.discarded && openRun?.runId === event.runId) {
+					// REWIND: the run's conversational contribution is void. Restore
+					// the run-start working state, then re-append what arrived during
+					// the run (in arrival order) to messages AND pending — even inputs
+					// the dead run acknowledged, because a discarded run's
+					// acknowledgments are void too. Mid-run compaction vanishes with
+					// the rewind (the rebased base and its summary were this run's
+					// contribution). Pokes are NOT restored: a poke's purpose —
+					// prodding THIS run to settle — died with the run, and replaying
+					// it would nag the fresh run with a stale instruction. Usage
+					// totals stay (the cost was real); the live context size is
+					// unknown until the fresh run's first step reports usage.
+					const restored = openRun.arrivals.filter((arrival) => !arrival.poke);
+					messages = [...openRun.messages, ...restored.map((arrival) => arrival.entry.tagged)];
+					pendingInputs = [...openRun.pendingInputs, ...restored.map((arrival) => arrival.entry)];
+					totals = { ...totals, contextTokens: null };
+				} else if (!event.preservePending && !event.discarded) {
+					// A cancelled/failed run settles its ordinary initiating message, but
+					// cannot settle queued input that no persisted step causally saw.
 					pendingInputs = pendingInputs.filter((input) => input.queueId !== null);
 				}
+				openRun = null;
 				// Keep the crash-loop count while queued recovery work survives this
 				// terminal event; otherwise every pre-step failure would reset the
 				// breaker and retry forever on each process restart.

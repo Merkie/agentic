@@ -229,6 +229,25 @@ work durable for a later manual `resume()`. Sweeps keep at most `maxConcurrent`
 starts. Manual `resume()` is uncapped. Sweep kicks re-check under the session
 lock, so racing sweeps/sends never double-resume.
 
+Recovery of an interrupted OPEN run is chosen per session by
+`autoResume.onInterrupted?: (sessionId) => "resume" | "restart" | "fail"`,
+consulted under the session lock after reconciliation (queued-only recovery
+never consults it — nothing to discard). `"resume"` (the default, and the
+contained fallback when the hook throws/rejects) re-enters the run in place.
+`"restart"` — for agents whose tool state lived in process memory and died
+with it — closes the dead run with `run-end { status: "failed", discarded:
+true }` and re-drives its inputs in a fresh run via the normal queued-recovery
+path; it appends the same `run-resume { auto: true }`, so `maxAttempts` caps
+crash-looping restarts identically. `"fail"` closes the run plainly (initiating
+input settled, unseen queued input preserved), re-drives nothing, and consumes
+no attempt. Replay handles `discarded` by snapshot-rewind: `run-start`
+snapshots the working state, and a discarded run-end restores it plus the
+non-poke user messages that arrived during the run — to messages AND pending,
+because a discarded run's acknowledgments are void (pokes are not restored;
+their purpose died with the run). Mid-run compaction inside a discarded run
+vanishes with the rewind; usage totals do not (the cost was real). `runLoop`
+never writes `discarded` — only the sweep's restart path does.
+
 ### Billing (BYOK vs credits)
 
 Cost extraction (`src/usage.ts`) is `is_byok`-aware. OpenRouter usage

@@ -121,6 +121,25 @@ maxConcurrent, staggerMs }`. `maxConcurrent` defaults to `4`; `staggerMs`
 still spaces the start of each resumed run, while the concurrency cap prevents
 a large interrupted backlog from creating an unbounded provider stampede.
 
+By default the sweep resumes an interrupted run in place. Agents whose tool
+state lives in process memory (a sandbox, a headless browser) should restart
+instead — the ledger survives a crash but that state doesn't, and resuming
+would have the model act on phantom state:
+
+```ts
+createAgentic({
+  autoResume: {
+    agentFor: (id) => buildAgent(id), // rebuilds tools + a fresh sandbox
+    onInterrupted: () => "restart",   // discard the dead run's partial work,
+  },                                  // re-run its instruction from scratch
+});
+```
+
+The dead run stays in history as a failed response; its user message is
+answered by the fresh run. `"fail"` closes the run with no re-drive; a
+throwing hook falls back to `"resume"` (the default). Restarts count toward
+the same `maxAttempts` cap as resumes.
+
 ## Reading a chat
 
 `agentic.transcript(sessionId)` is THE read API for rendering a conversation

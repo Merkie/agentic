@@ -174,6 +174,16 @@ export type StoredEvent =
 			status: "completed" | "cancelled" | "failed";
 			/** Reconciliation close: do not settle inputs appended after this run's final step. */
 			preservePending?: boolean;
+			/**
+			 * The run's conversational contribution is void: replay excludes its
+			 * step output and returns its inputs to pending — even inputs the run
+			 * acknowledged, because a discarded run's acknowledgments are void
+			 * too. Usage totals are NOT rewound (the cost was real). Only ever
+			 * written with `status: "failed"`, and only by the auto-resume
+			 * restart path (`autoResume.onInterrupted` → `"restart"`) — runLoop
+			 * never writes it. Additive v1 field.
+			 */
+			discarded?: true;
 			error?: SerializedError;
 	  };
 
