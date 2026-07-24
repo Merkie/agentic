@@ -78,7 +78,9 @@ const chat = agentic.session("chat:user-123", {
   tools: { /* your tools */ },
   compaction: { limit: 0.3 },          // compact at 30% of context window
 });
-const reply = await chat.send("hey!", { onPart: (p) => {/* stream to UI */} });
+const reply = await chat.send("hey!", {
+  onPart: (part, { responseId }) => {/* stream to UI, keyed on responseId */},
+});
 
 // ── workflow task with a guaranteed outcome ───────────────────────────
 const outcome = await agentic.task({
@@ -119,49 +121,125 @@ maxConcurrent, staggerMs }`. `maxConcurrent` defaults to `4`; `staggerMs`
 still spaces the start of each resumed run, while the concurrency cap prevents
 a large interrupted backlog from creating an unbounded provider stampede.
 
-The built-in storage providers preserve binary image/audio parts. Custom
-storage adapters should persist events with `encodeEvent(event)` and restore
-them with `decodeEvent(json)` instead of plain JSON serialization. Framework
-poke reminders are stored as `user-message` events with `meta.poke`; filter
-those when projecting a user-visible transcript. Compaction summarizes older
-multimodal turns as text, so binary parts only remain verbatim when they fall
-inside `keepRecent`.
+## Reading a chat
 
-Every message is identified and timestamped. User messages carry an `id` on
-their ledger event; assistant/tool messages are persisted as
-`{ id, message }` envelopes inside each `step` (tool calls additionally keep
-the AI SDK's `toolCallId`). `session.messages()` returns
-`{ id, at, message }` entries — ids are minted once at append time and are
-stable across replays, restarts, and compaction (a compacted-away tail
-message keeps its original id and persist time in the new base; only the
-summary message gets a fresh id). Live `AgenticEvent`s are stamped with `at`,
-and the live `step` event carries the same identified messages the ledger
-recorded, so a UI can reconcile its streamed draft against durable identities
-without reloading. `RunResult` names the run that produced it (`runId`), so a
-resolved `send()`/`resume()` correlates directly with run/step events and
-their messages. v0.8 requires ledgers written by v0.7 or later; pre-v0.7
-session data is unsupported and fails to load with a descriptive error.
+`session.transcript()` is THE read API for rendering a conversation:
 
-Queued-input causality is recorded on each `step`; raw append order alone is
-not a transcript (an in-flight step can be persisted after a newly arrived
-user message without having seen it). Use `session.messages()` or
-`replaySession()` for the model conversation. UI/database adapters should call
-`projectRun(events, runId)`, which returns causal response segments and the
-inputs still pending after that run; adapters only decide what is visible and
-write it to their own schema. A durable non-error step, including a tool
-call/result step, counts as having handled the input ids it records. If the run
-later fails, callers receive that failure and the input is not replayed
-automatically, avoiding duplicate tool side effects. An input that only saw an
-empty/error step remains pending for recovery.
+```ts
+app.get("/chats/:id/messages", async (req, res) => {
+  res.json(await agentic.session(req.params.id, agent).transcript());
+});
+```
 
-`onPart` is a best-effort live transport, not a durable subscription. A caller
-that reconnects—or whose queued input is picked up by a different serialized
-run—should use the resolved `RunResult` and `session.messages()` as the source
-of truth; historical stream parts are not replayed from storage.
+It returns user turns and response segments in causal display order — array
+order IS the display order; never re-sort by timestamp. Framework internals
+(poke reminders, compaction summaries) are already filtered out; canonical
+text is pre-extracted onto each item (`item.text`); every id is durable,
+minted once at append time and stable across restarts, compaction, and from
+the first streamed token to the terminal state; and every response item
+carries its lifecycle: `streaming | completed | cancelled | failed |
+interrupted`. `projectSession(events)` is the pure form for a ledger you
+already hold; `projectRun(events, runId)` scopes to one run.
+`session.messages()` is the model's replay view — feed it to models, don't
+render it. v0.8 reads ledgers written by v0.7 or later; older data fails to
+load with a descriptive error.
+
+## Streaming with stable identities
+
+Every id a UI needs exists before the first token arrives. `onAccepted` fires
+once per send — after the user message is durably appended, before its first
+stream part — and every `onPart` delivery carries a `StreamContext` whose
+`responseId` equals the transcript response item the pass streams into. Key
+the optimistic bubble on it; the durable transcript confirms it, never
+re-keys it:
+
+```ts
+const result = await chat.send(text, {
+  onAccepted: ({ messageId }) => ui.userBubble(messageId, text),
+  onPart: (part, { responseId }) => {
+    if (part.type === "text-delta") ui.append(responseId, part.text);
+  },
+});
+// result.messageId — this send's durable user-message id (onAccepted's)
+// result.runId    — the run that causally answered it
+```
+
+No client-side id minting and no placeholder rows: while a run is in flight
+the transcript already contains its `streaming` response item. Stream parts
+are live-only and never replayed; the transcript is the durable source of
+truth.
+
+## Reconnecting
+
+`session.attach(listener)` live-tails every run this process executes for a
+session — the currently live one and any that start later. A reconnecting
+client attaches first, snapshots, then dedupes by character offset:
+
+```ts
+const detach = session.attach((part, ctx) => forward(part, ctx));
+const snapshot = await session.transcript(); // streaming item carries partialText
+// drop text deltas whose ctx.offset < that item's partialText.length
+```
+
+The snapshot and the stream can never double-render a character.
+
+## Progress over the wire
+
+`progressFromPart(part, context)` maps raw stream parts to a small
+JSON-serializable activity vocabulary (`text` / `reasoning` / `tool-start` /
+`tool-end`, keyed by `responseId`) so both sides of the wire stop switching
+over AI SDK part types:
+
+```ts
+session.attach((part, ctx) => {
+  const event = progressFromPart(part, ctx);
+  if (event) res.write(`data: ${JSON.stringify(event)}\n\n`);
+});
+```
+
+Terminal state doesn't travel on this stream — completion, failure, and
+cancellation arrive through `onAccepted`/`RunResult`/the transcript.
+
+## Custom storage: the provider contract
+
+A provider is `append` + `load` (+ optional `listSessions`) and must be a
+dumb pipe:
+
+- `append()` resolving means the event is durable, atomically — the framework
+  acknowledges callers and advances the run on that basis.
+- `load()` returns exactly what was appended, in append order, including your
+  own just-resolved appends (read-your-writes).
+- Events round-trip verbatim: persist with `encodeEvent` and restore with
+  `decodeEvent`, not `JSON.stringify` — the codec preserves binary
+  image/audio parts and carries the event schema version.
+- One writer per session per process group: locks and live-run mailboxes are
+  instance-local, so cross-process concurrent runs on one session are not
+  supported.
+- No projection, dual writes, or status columns inside `append()` — the read
+  side is `transcript()`, over the events alone.
+
+The built-in providers honor all of this (`fileStorage` durability is bounded
+by the OS page cache — it does not fsync per event, so a power loss can drop
+the newest events; a process crash cannot). Compaction summarizes older
+multimodal turns as text, so binary parts only remain verbatim while they
+fall inside `keepRecent`.
+
+## The consumer boundary
+
+Four things an app never does, and where each need is served instead:
+
+| Never | Instead |
+|---|---|
+| Insert placeholder/optimistic rows for in-flight turns | `transcript()` projects the streaming state |
+| Read or write ledger events outside your provider | `transcript()` / `projectSession` |
+| Mint message/turn ids | `onAccepted` · `RunResult.messageId` · `StreamContext.responseId` |
+| Parse raw events or stream parts into app vocabulary | `progressFromPart` · transcript statuses |
+
+## Cancellation
 
 Aborting a send's `abortSignal` is a durable, terminal cancellation. Agentic
 saves the current partial assistant step before `run-end`, returns its text in
-the cancelled `RunResult`, and includes it in `session.messages()`. Completed
+the cancelled `RunResult`, and keeps it in the transcript. Completed
 tool calls are paired with their real results when available, or with a
 synthetic interruption result, so the saved conversation remains safe to
 replay. A restart between the partial-step append and `run-end` reconciles the

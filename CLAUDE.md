@@ -27,17 +27,33 @@ any process can rebuild the conversation by replaying the ledger. Crash
 recovery, resume, message queueing, and auditing all fall out of this.
 
 - `src/agentic.ts` — public API: `createAgentic()` → `session()` (durable
-  chat: `send`/`resume`/`messages`/`isInterrupted`), `task()`
-  (guaranteed-outcome workflows via `submit_deliverable`/`cancel_task`
-  tools), `withRetries()`, `resumeInterrupted()` (the auto-resume sweep).
-  Holds per-session locks and the live-run map.
+  chat: `send`/`resume`/`attach`/`messages`/`transcript`/`stats`/
+  `isInterrupted`), `task()` (guaranteed-outcome workflows via
+  `submit_deliverable`/`cancel_task` tools), `withRetries()`,
+  `resumeInterrupted()` (the auto-resume sweep). Holds per-session locks and
+  the live-run map. `Agentic.storage` was removed in v0.8: the app constructed
+  the provider and holds its own reference; re-exposing it invited ledger
+  reads/writes outside the projection APIs.
 - `src/run.ts` — `runLoop()`, the heart: replay ledger → streamText → persist
   steps → repeat. Owns retries (via `classifyFailure`), mid-run compaction,
-  poking, and the `RunMailbox` for live message queueing.
+  poking, and the `RunMailbox` for live message queueing. Internal: driving
+  the loop directly bypasses locks and live-run registration, so none of it
+  is exported from the package (tests import the module directly).
 - `src/replay.ts` — `replaySession(events)`: ledger → messages + usage
-  totals + `interruptedRunId` + `pendingMessages`.
-- `src/storage.ts` — `StorageProvider` interface (`append`/`load`, optional
-  `listSessions`); `fileStorage` (JSONL) and `memoryStorage` built in.
+  totals + `interruptedRunId` + `pendingMessages` — the MODEL's view.
+  Exported under the index's advanced/debug section; app rendering goes
+  through projection instead.
+- `src/projection.ts` — the read side: `projectRun` (causal response
+  segments for one run), `projectSession` (the full renderable transcript
+  behind `session.transcript()`), `textOf`, `StreamContext`.
+- `src/progress.ts` — `progressFromPart`: raw stream part → canonical
+  JSON-serializable activity event for SSE/WebSocket forwarding.
+- `src/storage.ts` — built-in `StorageProvider` implementations:
+  `fileStorage` (JSONL), `memoryStorage`, and the `serializedStorage`
+  wrapper. The interface itself and its documented contract (durable atomic
+  append, ordered read-your-writes load, verbatim round-trip via the codec,
+  single writer per session per process group, no projection inside append)
+  live on the `StorageProvider` JSDoc in `src/types.ts`.
 - `src/serialize.ts` — exported binary-safe `StoredEvent` codec used by both
   built-in providers and available to custom storage adapters.
 - `src/failure.ts` / `src/backoff.ts` — error classification
@@ -52,8 +68,12 @@ recovery, resume, message queueing, and auditing all fall out of this.
 - `src/toolGuard.ts` — caps tool result sizes.
 - `src/logEvents.ts` — the default console logger (`createAgentic({ logs:
   true })`): one chalk-colored line per `AgenticEvent`.
-- `src/index.ts` — the export surface, organized in levels: Level 0
-  (provider + logging), Level 1 (à-la-carte helpers), Level 2 (the harness).
+- `src/index.ts` — the export surface, grouped by API: the harness
+  (`createAgentic` + types), projection (transcripts + live progress),
+  storage (providers + event codec), à-la-carte helpers, and an
+  advanced/debug section holding only `replaySession`. Loop, backoff,
+  compaction, and totals internals are deliberately NOT re-exported —
+  consumers get the harness and the read APIs; tests reach into modules.
 
 ### Message queueing (the mailbox)
 
@@ -65,11 +85,12 @@ the message in. Key invariants, in `src/run.ts`:
 - The queue IS storage — the mailbox carries only `queueId`s, never content.
 - Pickup is per step, so batched parallel tool calls always complete before a
   queued message is folded in; a tool-call/result pair is never split.
-- `hoistSandwichedUsers()` reorders (per-request only) a message that landed
-  mid-step so the model reads it as the newest input; the ledger keeps
-  arrival order. `replaySession()` uses each step's `inputQueueIds` to make
-  the same causal projection; consumers must not treat raw append order as a
-  ready-to-display transcript.
+- `hoistPendingInputs()` reorders (per-request only) the exact unanswered
+  input messages replay identifies, so a message that landed mid-step is read
+  by the model as the newest input; the ledger keeps arrival order.
+  `replaySession()` uses each step's `inputQueueIds` to make the same causal
+  projection; consumers must not treat raw append order as a ready-to-display
+  transcript.
 - A run never ends with unanswered input queued; `mailbox.accepting` flips
   false synchronously before `run-end` so a racing `send()` falls back to its
   own run.
@@ -207,8 +228,8 @@ Totals accumulate `billedCost`, never raw `cost`.
 
 ## Testing
 
-Tests live next to source (`src/harness.test.ts`, `src/openrouter.test.ts`)
-and run fully offline: model calls use
+Tests live next to source (`src/*.test.ts` — harness, transcript, attach,
+projection, storage, modelMeta, openrouter) and run fully offline: model calls use
 `MockLanguageModelV3` from `ai/test` with hand-built `LanguageModelV3StreamPart`
 arrays, storage uses `memoryStorage()`, and context windows are pinned with
 `setContextWindow("mock/model", …)`. No API keys needed.

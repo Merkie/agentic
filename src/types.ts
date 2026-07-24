@@ -180,6 +180,27 @@ export type StoredEvent =
 /**
  * Bring-your-own persistence. All the framework needs is append + load in
  * order. Implementations may be sync or async (file, SQLite, Prisma, Redis…).
+ *
+ * The contract every implementation must honor:
+ *
+ * - **append() resolving means durable.** The framework treats a resolved
+ *   append as committed — it acknowledges callers and advances the run on
+ *   that basis. Each event is atomic: persisted entirely or not at all,
+ *   never a torn half-write that load() later returns.
+ * - **load() returns exactly what was appended, in append order**, including
+ *   this process's own just-resolved appends (read-your-writes). The loop
+ *   replays after every step; a stale or reordered read corrupts the run.
+ * - **Events must round-trip verbatim.** Persist with {@link encodeEvent} and
+ *   restore with {@link decodeEvent} rather than JSON.stringify/parse — the
+ *   codec preserves binary message parts and carries the event schema
+ *   version, which is how future shape changes migrate cleanly.
+ * - **One writer per session per process group.** Session locks and live-run
+ *   mailboxes are instance-local; two processes running the same session
+ *   concurrently interleave steps into one ledger. Not supported — route all
+ *   runs for a session through one Agentic instance.
+ * - **Providers are dumb pipes.** No projection, no dual writes, no
+ *   transcript rows maintained inside append() — the read side is
+ *   `session.transcript()` / {@link projectSession}, over the events alone.
  */
 export interface StorageProvider {
 	append(sessionId: string, event: StoredEvent): MaybePromise<void>;

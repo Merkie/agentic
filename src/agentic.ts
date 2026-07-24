@@ -244,8 +244,6 @@ export interface Agentic {
 	 * run. Returns true only when this call newly requested cancellation.
 	 */
 	cancel(sessionId: string, reason?: unknown): boolean;
-	/** The underlying storage, for app-level queries. */
-	storage: StorageProvider;
 }
 
 function toUserMessage(content: string | ModelMessage): ModelMessage {
@@ -1251,7 +1249,6 @@ export function createAgentic(options: AgenticOptions = {}): Agentic {
 			live.controller.abort(reason ?? new Error("Cancelled"));
 			return true;
 		},
-		storage,
 	};
 }
 
@@ -1366,6 +1363,13 @@ function lastAssistantText(messages: ModelMessage[]): string {
 	return "";
 }
 
+// A task outcome recovered from persisted history. Totals are deliberately
+// absent — a history scan cannot know them; the caller attaches the replayed
+// session's totals when it builds the full TaskOutcome.
+type SettledTaskOutcome<T> =
+	| { status: "submitted"; deliverable: T; sessionId: string }
+	| { status: "cancelled"; reason: string; sessionId: string };
+
 // Scan a replayed conversation for an already-settled task outcome: a
 // submit_deliverable tool result with { accepted: true } (deliverable comes
 // from the paired tool-call input) or a cancel_task result.
@@ -1373,7 +1377,7 @@ function findSettledOutcome<T>(
 	messages: ModelMessage[],
 	schema: ZodType<T> | undefined,
 	sessionId: string,
-): TaskOutcome<T> | null {
+): SettledTaskOutcome<T> | null {
 	const callInputs = new Map<string, unknown>();
 	for (const message of messages) {
 		if (!Array.isArray(message.content)) continue;
@@ -1399,21 +1403,11 @@ function findSettledOutcome<T>(
 					if (!check.success) continue;
 					deliverable = check.data;
 				}
-				return {
-					status: "submitted",
-					deliverable: deliverable as T,
-					totals: undefined as unknown as UsageTotals,
-					sessionId,
-				};
+				return { status: "submitted", deliverable: deliverable as T, sessionId };
 			}
 			if (part.toolName === "cancel_task" && value?.ok === true) {
 				const input = callInputs.get(part.toolCallId) as { reason?: string } | undefined;
-				return {
-					status: "cancelled",
-					reason: input?.reason ?? "Cancelled",
-					totals: undefined as unknown as UsageTotals,
-					sessionId,
-				};
+				return { status: "cancelled", reason: input?.reason ?? "Cancelled", sessionId };
 			}
 		}
 	}

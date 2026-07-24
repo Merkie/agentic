@@ -124,23 +124,14 @@ function ledgerHasQueued(events: StoredEvent[], queueId: string): boolean {
 	return false;
 }
 
-// A queued message that arrived while a step was streaming sits in the
-// ledger BEFORE that step's event, so the replayed conversation shows it
-// sandwiched under model output that never saw it. For the next request,
-// move that trailing user block after the model's output so the model reads
-// it as the newest input. Per-request only — the ledger keeps arrival order.
-// Exported for tests: a splice off-by-one here would wedge a user message
-// between a tool call and its result, which providers reject outright.
-export function hoistSandwichedUsers(messages: ModelMessage[], max: number): void {
-	if (messages.length === 0 || max <= 0) return;
-	const queued: ModelMessage[] = [];
-	for (let index = messages.length - 1; index >= 0 && queued.length < max; index--) {
-		if (messages[index].role !== "user") continue;
-		queued.unshift(...messages.splice(index, 1));
-	}
-	messages.push(...queued);
-}
-
+// A pending input that arrived while a step was streaming sits in the ledger
+// BEFORE that step's event, so the replayed conversation shows it sandwiched
+// under model output that never saw it. For the next request, move those
+// unanswered inputs after the model's output so the model reads them as the
+// newest input. Per-request only — the ledger keeps arrival order. A splice
+// mistake here would wedge a user message between a tool call and its
+// result, which providers reject outright; replay identifies the exact
+// pending messages, so whole-message moves are safe.
 function hoistPendingInputs(messages: SessionMessage[], pending: SessionMessage[]): void {
 	const actionable: SessionMessage[] = [];
 	for (const message of pending) {

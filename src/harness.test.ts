@@ -8,7 +8,7 @@ import { retryDelayMs } from "./backoff.js";
 import { classifyFailure } from "./failure.js";
 import { setContextWindow } from "./modelMeta.js";
 import { replaySession } from "./replay.js";
-import { createMailbox, hoistSandwichedUsers, runLoop } from "./run.js";
+import { createMailbox, runLoop } from "./run.js";
 import { sanitizeConversation } from "./sanitize.js";
 import { memoryStorage } from "./storage.js";
 import type { AgenticEvent, StepUsage, StoredEvent, StoredMessage } from "./types.js";
@@ -3497,84 +3497,6 @@ describe("crash-window finalization", () => {
 			"user",
 			"assistant",
 		]);
-	});
-});
-
-describe("hoistSandwichedUsers", () => {
-	const user = (content: string): ModelMessage => ({ role: "user", content });
-	const toolCalls = (...ids: string[]): ModelMessage => ({
-		role: "assistant",
-		content: ids.map((id) => ({
-			type: "tool-call",
-			toolCallId: id,
-			toolName: "lookup",
-			input: {},
-		})),
-	});
-	const toolResults = (...ids: string[]): ModelMessage => ({
-		role: "tool",
-		content: ids.map((id) => ({
-			type: "tool-result",
-			toolCallId: id,
-			toolName: "lookup",
-			output: { type: "text", value: "ok" },
-		})),
-	});
-	const roles = (messages: ModelMessage[]) => messages.map((m) => m.role);
-
-	it("moves a sandwiched user past a tool-call/result pair without splitting it", () => {
-		const messages = [user("question"), user("queued"), toolCalls("a"), toolResults("a")];
-		hoistSandwichedUsers(messages, 1);
-		expect(roles(messages)).toEqual(["user", "assistant", "tool", "user"]);
-		expect(messages[3]).toEqual(user("queued"));
-	});
-
-	it("treats a batched parallel tool-call step as one block", () => {
-		const messages = [user("question"), user("queued"), toolCalls("a", "b"), toolResults("a", "b")];
-		hoistSandwichedUsers(messages, 1);
-		expect(roles(messages)).toEqual(["user", "assistant", "tool", "user"]);
-		expect(messages[3]).toEqual(user("queued"));
-	});
-
-	it("hoists past multiple trailing steps", () => {
-		// the message raced past a load snapshot, so two whole steps landed on top
-		const messages = [
-			user("question"),
-			user("queued"),
-			toolCalls("a"),
-			toolResults("a"),
-			toolCalls("b"),
-			toolResults("b"),
-		];
-		hoistSandwichedUsers(messages, 1);
-		expect(roles(messages)).toEqual(["user", "assistant", "tool", "assistant", "tool", "user"]);
-		expect(messages[5]).toEqual(user("queued"));
-	});
-
-	it("lifts only the queued tail of the user block, preserving order", () => {
-		const messages = [user("answered"), user("q1"), user("q2"), toolCalls("a"), toolResults("a")];
-		hoistSandwichedUsers(messages, 2);
-		expect(roles(messages)).toEqual(["user", "assistant", "tool", "user", "user"]);
-		expect(messages[0]).toEqual(user("answered"));
-		expect(messages[3]).toEqual(user("q1"));
-		expect(messages[4]).toEqual(user("q2"));
-	});
-
-	it("is a no-op when input is already trailing or max is 0", () => {
-		const trailing = [user("question"), toolCalls("a"), toolResults("a"), user("queued")];
-		hoistSandwichedUsers(trailing, 1);
-		expect(roles(trailing)).toEqual(["user", "assistant", "tool", "user"]);
-
-		const untouched = [user("question"), user("queued"), toolCalls("a"), toolResults("a")];
-		hoistSandwichedUsers(untouched, 0);
-		expect(roles(untouched)).toEqual(["user", "user", "assistant", "tool"]);
-	});
-
-	it("is a no-op when there is no user block to hoist", () => {
-		const messages = [toolCalls("a"), toolResults("a")];
-		hoistSandwichedUsers(messages, 1);
-		expect(roles(messages)).toEqual(["assistant", "tool"]);
-		hoistSandwichedUsers([], 1);
 	});
 });
 

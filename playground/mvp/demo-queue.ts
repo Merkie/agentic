@@ -18,8 +18,11 @@ import { createAgentic, fileStorage } from "../../src/index.js";
 const DIR = "./playground/mvp/.queue-demo";
 rmSync(DIR, { recursive: true, force: true });
 
+// The app constructs the provider and keeps its own reference — the harness
+// does not re-expose it (read conversations via session.transcript()).
+const storage = fileStorage(DIR);
 const agentic = createAgentic({
-	storage: fileStorage(DIR),
+	storage,
 	logs: true,
 });
 
@@ -57,7 +60,7 @@ console.log(`\nmerged run status: ${r1.status}`);
 console.log(`same RunResult for both sends: ${r1 === r2}`);
 console.log(`final text:\n---\n${r1.text}\n---`);
 
-const events = await agentic.storage.load("queue-demo");
+const events = await storage.load("queue-demo");
 const counts = events.reduce<Record<string, number>>((acc, e) => {
 	acc[e.type] = (acc[e.type] ?? 0) + 1;
 	return acc;
@@ -73,9 +76,10 @@ if (!/42/.test(r1.text)) console.log("  (note: 7*6 answer not in final text — 
 
 // ── Act 2: a queued message orphaned by a crash is resumable ─────────────
 console.log("\n── Act 2: orphaned queued message → interruptedSessions → resume ──");
-await agentic.storage.append("orphan-demo", {
+await storage.append("orphan-demo", {
 	type: "user-message",
 	at: new Date().toISOString(),
+	id: "crashed-before-run",
 	message: { role: "user", content: "How many moons does Mars have? Use slow_lookup." },
 	meta: { queued: true, queueId: "crashed-before-run" },
 });
