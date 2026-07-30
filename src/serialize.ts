@@ -105,6 +105,15 @@ function isV1Shape(event: StoredEvent): boolean {
 }
 
 /**
+ * Binary-safe JSON parse for a stored event, WITHOUT the schema check that
+ * makes {@link decodeEvent} the single normalization point. Internal: only the
+ * legacy upgrader needs to read an event this agentic deliberately refuses.
+ */
+export function parseEventJson(json: string): unknown {
+	return JSON.parse(json, reviveBinary);
+}
+
+/**
  * Serialize a ledger event without losing Uint8Array, Buffer, or ArrayBuffer
  * values carried by multimodal message parts. Adapter authors should use this
  * rather than plain JSON.stringify when persisting StoredEvent values.

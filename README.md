@@ -166,7 +166,32 @@ you already hold a session; `projectSession(events)` is the pure form for a
 ledger you already hold; `projectRun(events, runId)` scopes to one run.
 `session.messages()` is the model's replay view — feed it to models, don't
 render it. v0.9 reads ledgers written by v0.7 or later; older data fails to
-load with a descriptive error.
+load with a descriptive error — see below to upgrade it.
+
+## Upgrading a pre-v0.7 ledger
+
+`decodeEvent` refuses events written before v0.7 rather than guessing at the
+identity and causal membership they predate. `upgradeLegacySession` converts
+such a ledger once, offline, so the strict decoder stays the only runtime read
+path:
+
+```ts
+// Your own storage — the provider contract is append-only, so a migration
+// reaches past it and rewrites the session's rows directly, in order.
+const raw = await readSessionRows(sessionId);     // strings, in append order
+await rewriteSessionRows(sessionId, upgradeLegacySession(raw));
+```
+
+Pass the session's complete event list — the walk is stateful, so a partial
+slice would settle inputs against an incomplete view. It re-encodes in place:
+identity is derived from ledger position, membership is replayed from the
+`acknowledgesInput`/`inputQueueIds` those events already recorded (never
+inferred from append order), and pre-v0.7's cumulative tool-loop steps — which
+re-persisted the whole run on every step — are reduced to the incremental form
+current projection expects, so replayed text is not duplicated. Events already
+in the current schema pass through untouched, which makes it safe on the mixed
+ledger left by an app that upgraded mid-conversation, and running it twice
+produces byte-identical output.
 
 ## Streaming with stable identities
 

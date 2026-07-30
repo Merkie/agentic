@@ -170,7 +170,17 @@ and paired with timestamps:
   version (`v: 1`), stamped by `encodeEvent`; `decodeEvent` is the single
   validation/normalization point — it stamps well-formed unversioned (v0.7)
   events and rejects pre-v0.7 shapes and newer-than-known versions with
-  descriptive errors. Pre-v0.7 session data is unsupported.
+  descriptive errors. Pre-v0.7 session data is unsupported at read time and
+  must be migrated first: `upgradeLegacySession(rawEvents)` (`src/legacy.ts`,
+  the only consumer of `parseEventJson`) re-encodes one session's stored
+  strings into the current schema. It adopts v0.6's `inputId` as `id`, wraps
+  raw messages in identity envelopes, replays the recorded
+  `acknowledgesInput`/`inputQueueIds` to reconstruct `inputMessageIds` rather
+  than inferring turns from append order, and collapses pre-v0.7's cumulative
+  steps (each step re-persisted the whole run) to the incremental form
+  projection expects. Idempotent, and current events pass through unchanged so
+  mixed ledgers are safe. Deliberately NOT wired into `decodeEvent`: the read
+  path stays strict and the migration stays a one-time, explicit act.
 
 `task({ durable: false })` runs against an isolated in-memory ledger. Use it
 for disposable presentation work that needs task validation/retries but should

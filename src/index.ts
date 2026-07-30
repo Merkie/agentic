@@ -49,6 +49,9 @@ export type { ProgressEvent } from "./progress.js";
 
 // ── storage: bring-your-own persistence + the event codec ────────────────
 export { decodeEvent, encodeEvent } from "./serialize.js";
+// One-time offline migration for pre-v0.7 ledgers; see "Upgrading a pre-v0.7
+// ledger" in the README. Not part of any runtime read path.
+export { upgradeLegacySession } from "./legacy.js";
 export { fileStorage, memoryStorage, serializedStorage } from "./storage.js";
 export type { StorageProvider, StoredEvent, StoredMessage } from "./types.js";
 
